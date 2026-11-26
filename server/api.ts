@@ -43,7 +43,18 @@ import {
   getFirebaseAdminMessaging,
   isFcmServerPushConfigured,
 } from "./firebase-admin";
-import { broadcastEvent, isUserConnected, isUserViewingThread, sendToUser } from "./ws";
+import {
+  broadcastEvent,
+  forwardCallSignal,
+  getUserAliases,
+  initiateCallSession,
+  isUserConnected,
+  isUserViewingThread,
+  registerSseClient,
+  resolveUserFromRequest,
+  sendToUser,
+  setSseActiveThread,
+} from "./ws";
 
 type AuthedRequest = Request & { authUser?: DbUser; authToken?: string; firebaseUid?: string };
 
@@ -645,6 +656,35 @@ export function createApiRouter() {
       otpConfigured: getTwilioConfig().configured,
       emailOtpConfigured: getResendConfig().configured,
     });
+  });
+
+  // Real-time Server-Sent Events stream (fallback when WebSockets are blocked by proxies/firewalls)
+  router.get("/events", async (req, res) => {
+    const user = await resolveUserFromRequest(req);
+    if (!user) {
+      res.status(401).json({ error: "Authentication required." });
+      return;
+    }
+
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    const cleanup = registerSseClient(user.id, res);
+    req.on("close", cleanup);
+    req.on("error", cleanup);
+  });
+
+  router.post("/thread/active", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const peerId =
+      typeof (req.body as { peerId?: string } | undefined)?.peerId === "string"
+        ? (req.body as { peerId: string }).peerId.trim()
+        : "";
+    setSseActiveThread(me.id, peerId || null);
+    res.json({ ok: true });
   });
 
   router.get("/auth/otp-status", (_req, res) => {
@@ -2804,9 +2844,16 @@ export function createApiRouter() {
   // Fetch thread messages with a peer (supports ?q= search)
   router.get("/messages/:peerId", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
-    const peerId = String(req.params["peerId"] ?? "");
-    const peer = (await db.prepare("SELECT * FROM users WHERE id = ?").get(peerId)) as
-      DbUser | undefined;
+    const rawPeerId = String(req.params["peerId"] ?? "").trim();
+    const peerAliases = getUserAliases(rawPeerId);
+    const peerPlaceholders = peerAliases.map(() => "?").join(",");
+    const peer = (
+      peerAliases.length > 0
+        ? await db
+            .prepare(`SELECT * FROM users WHERE id IN (${peerPlaceholders}) LIMIT 1`)
+            .get(...peerAliases)
+        : undefined
+    ) as DbUser | undefined;
     if (!peer) {
       res.status(404).json({ error: "User not found." });
       return;
@@ -2921,13 +2968,16 @@ export function createApiRouter() {
     };
 
     const targetId = String(peerId ?? "").trim();
-    if (!targetId || targetId === me.id) {
+    const targetAliases = getUserAliases(targetId);
+    if (!targetId || targetAliases.some((a) => getUserAliases(me.id).includes(a))) {
       res.status(400).json({ error: "Valid recipient required." });
       return;
     }
 
-    const peer = (await db.prepare("SELECT * FROM users WHERE id = ?").get(targetId)) as
-      DbUser | undefined;
+    const targetPlaceholders = targetAliases.map(() => "?").join(",");
+    const peer = (await db
+      .prepare(`SELECT * FROM users WHERE id IN (${targetPlaceholders}) LIMIT 1`)
+      .get(...targetAliases)) as DbUser | undefined;
     if (!peer) {
       res.status(404).json({ error: "Recipient not found." });
       return;
@@ -4326,29 +4376,272 @@ export function createApiRouter() {
     res.status(201).json({ ok: true, reportId });
   });
 
-  // Backend-enforced call initiation check
+  // Ephemeral WebRTC ICE / TURN credentials endpoint (never leaks permanent secrets to browser code)
+  let cachedRemoteIce: { servers: Array<Record<string, unknown>>; expiresAt: number } | null = null;
+
+  router.get("/calls/ice-servers", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const servers: Array<Record<string, unknown>> = [
+      {
+        urls: [
+          "stun:stun.l.google.com:19302",
+          "stun:stun1.l.google.com:19302",
+          "stun:stun2.l.google.com:19302",
+          "stun:stun.cloudflare.com:3478",
+        ],
+      },
+    ];
+    let turnConfigured = false;
+    let ttlSeconds = 3600;
+
+    // 1. Ephemeral HMAC-SHA1 TURN REST credentials (coturn / eturnal / standard TURN REST API)
+    const turnUrlsRaw = readConfiguredEnv("TURN_URLS") ?? readConfiguredEnv("TURN_URL") ?? "";
+    const turnUrls = turnUrlsRaw
+      .split(",")
+      .map((u) => u.trim())
+      .filter((u) => u.startsWith("turn:") || u.startsWith("turns:"));
+    const turnSecret = readConfiguredEnv("TURN_SECRET");
+    const parsedTtl = Number.parseInt(readConfiguredEnv("TURN_TTL_SECONDS") ?? "3600", 10);
+    const hmacTtl =
+      Number.isFinite(parsedTtl) && parsedTtl >= 60 ? Math.min(86400, parsedTtl) : 3600;
+
+    if (turnUrls.length > 0 && turnSecret) {
+      const expiry = Math.floor(Date.now() / 1000) + hmacTtl;
+      const userTag = crypto.createHash("sha256").update(me.id).digest("hex").slice(0, 12);
+      const username = `${expiry}:${userTag}`;
+      const credential = crypto.createHmac("sha1", turnSecret).update(username).digest("base64");
+      servers.push({ urls: turnUrls, username, credential });
+      turnConfigured = true;
+      ttlSeconds = hmacTtl;
+    } else if (turnUrls.length > 0) {
+      const turnUser = readConfiguredEnv("TURN_USERNAME");
+      const turnCred = readConfiguredEnv("TURN_CREDENTIAL");
+      if (turnUser && turnCred) {
+        servers.push({ urls: turnUrls, username: turnUser, credential: turnCred });
+        turnConfigured = true;
+      }
+    }
+
+    // 2. Server-only JSON ICE list if provided
+    const rawServerIceJson = readConfiguredEnv("ICE_SERVERS_JSON");
+    if (rawServerIceJson) {
+      try {
+        const parsed = JSON.parse(rawServerIceJson) as unknown;
+        if (Array.isArray(parsed)) {
+          for (const entry of parsed) {
+            if (
+              entry &&
+              typeof entry === "object" &&
+              "urls" in entry &&
+              (entry as { urls?: unknown }).urls
+            ) {
+              servers.push(entry as Record<string, unknown>);
+              const urlsVal = Array.isArray((entry as { urls: unknown }).urls)
+                ? (entry as { urls: unknown[] }).urls
+                : [(entry as { urls: unknown }).urls];
+              if (
+                urlsVal.some((u) => String(u).startsWith("turn:") || String(u).startsWith("turns:"))
+              ) {
+                turnConfigured = true;
+              }
+            }
+          }
+        }
+      } catch {
+        /* ignore malformed ICE_SERVERS_JSON */
+      }
+    }
+
+    // 3. Dynamic ephemeral TURN providers (Twilio NTS, Metered TURN API, Cloudflare TURN)
+    if (!turnConfigured) {
+      const nowMs = Date.now();
+      if (cachedRemoteIce && cachedRemoteIce.expiresAt > nowMs) {
+        servers.push(...cachedRemoteIce.servers);
+        turnConfigured = cachedRemoteIce.servers.length > 0;
+      } else {
+        const remoteServers: Array<Record<string, unknown>> = [];
+        let remoteTtl = 1800;
+
+        // 3a. Twilio Network Traversal Service (reuses existing TWILIO_ACCOUNT_SID + TWILIO_AUTH_TOKEN if set)
+        const twilioCfg = getTwilioConfig();
+        if (
+          twilioCfg.sid &&
+          twilioCfg.token &&
+          readConfiguredEnv("TWILIO_NTS_ENABLED") !== "false"
+        ) {
+          try {
+            const auth = Buffer.from(`${twilioCfg.sid}:${twilioCfg.token}`).toString("base64");
+            const resp = await fetch(
+              `https://api.twilio.com/2010-04-01/Accounts/${encodeURIComponent(twilioCfg.sid)}/Tokens.json`,
+              {
+                method: "POST",
+                headers: { Authorization: `Basic ${auth}` },
+                signal: AbortSignal.timeout(3000),
+              },
+            );
+            if (resp.ok) {
+              const data = (await resp.json()) as {
+                ttl?: string | number;
+                ice_servers?: Array<Record<string, unknown>>;
+              };
+              const list = Array.isArray(data.ice_servers) ? data.ice_servers : [];
+              for (const item of list) {
+                if (item && (item["urls"] || item["url"])) {
+                  const urls = item["urls"] ?? item["url"];
+                  remoteServers.push({
+                    urls,
+                    ...(item["username"] ? { username: item["username"] } : {}),
+                    ...(item["credential"] ? { credential: item["credential"] } : {}),
+                  });
+                }
+              }
+              const parsed = Number(data.ttl);
+              if (Number.isFinite(parsed) && parsed > 60) {
+                remoteTtl = Math.floor(parsed / 2);
+              }
+            }
+          } catch {
+            /* fallback to next provider / STUN */
+          }
+        }
+
+        // 3b. Metered.ca Ephemeral TURN REST API
+        const meteredApiUrl = readConfiguredEnv("METERED_API_URL");
+        const meteredDomain = readConfiguredEnv("METERED_DOMAIN");
+        const meteredKey =
+          readConfiguredEnv("METERED_SECRET_KEY") ?? readConfiguredEnv("METERED_API_KEY");
+        const meteredEndpoint =
+          meteredApiUrl ||
+          (meteredDomain && meteredKey
+            ? `https://${meteredDomain.replace(/^https?:\/\//i, "").replace(/\/+$/, "")}/api/v1/turn/credentials?apiKey=${encodeURIComponent(meteredKey)}`
+            : null);
+
+        if (
+          remoteServers.length === 0 &&
+          meteredEndpoint &&
+          /^https?:\/\//i.test(meteredEndpoint)
+        ) {
+          try {
+            const resp = await fetch(meteredEndpoint, { signal: AbortSignal.timeout(3000) });
+            if (resp.ok) {
+              const list = (await resp.json()) as unknown;
+              if (Array.isArray(list)) {
+                for (const item of list) {
+                  if (item && typeof item === "object" && "urls" in item) {
+                    remoteServers.push(item as Record<string, unknown>);
+                  }
+                }
+              }
+            }
+          } catch {
+            /* fallback cleanly */
+          }
+        }
+
+        // 3c. Cloudflare Calls / TURN ephemeral key generation
+        const cfKeyId = readConfiguredEnv("CLOUDFLARE_TURN_KEY_ID");
+        const cfApiToken = readConfiguredEnv("CLOUDFLARE_TURN_API_TOKEN");
+        if (remoteServers.length === 0 && cfKeyId && cfApiToken) {
+          try {
+            const resp = await fetch(
+              `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(cfKeyId)}/credentials/generate`,
+              {
+                method: "POST",
+                headers: {
+                  Authorization: `Bearer ${cfApiToken}`,
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({ ttl: 3600 }),
+                signal: AbortSignal.timeout(3000),
+              },
+            );
+            if (resp.ok) {
+              const data = (await resp.json()) as {
+                iceServers?: Record<string, unknown> | Array<Record<string, unknown>>;
+              };
+              if (Array.isArray(data.iceServers)) {
+                remoteServers.push(...data.iceServers);
+              } else if (data.iceServers && typeof data.iceServers === "object") {
+                remoteServers.push(data.iceServers);
+              }
+            }
+          } catch {
+            /* fallback cleanly */
+          }
+        }
+
+        if (remoteServers.length > 0) {
+          cachedRemoteIce = {
+            servers: remoteServers,
+            expiresAt: nowMs + remoteTtl * 1000,
+          };
+          servers.push(...remoteServers);
+          turnConfigured = true;
+          ttlSeconds = remoteTtl;
+        }
+      }
+    }
+
+    res.json({ iceServers: servers, turnConfigured, ttlSeconds });
+  });
+
+  // Backend-enforced call initiation (shared with WebSocket call:initiate)
   router.post("/calls/initiate", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
-    const { targetUserId, callType = "audio" } = req.body as {
+    const {
+      targetUserId,
+      targetId,
+      callId,
+      callType = "audio",
+    } = req.body as {
       targetUserId?: string;
+      targetId?: string;
+      callId?: string;
       callType?: "audio" | "video";
     };
-    const targetId = String(targetUserId ?? "").trim();
-    if (!targetId || targetId === me.id) {
-      res.status(400).json({ error: "Valid recipient required." });
-      return;
-    }
-    if (await isBlockedBetween(me.id, targetId)) {
-      res.status(403).json({ error: "Cannot initiate call. This user is blocked." });
-      return;
-    }
-    const callId = `call_${crypto.randomUUID()}`;
-    sendToUser(targetId, "call:incoming", {
+    const resolvedTarget = String(targetId ?? targetUserId ?? "").trim();
+    const result = await initiateCallSession({
+      callerId: me.id,
+      targetId: resolvedTarget,
       callId,
       callType: callType === "video" ? "video" : "audio",
-      from: await toPublicUser(me, true, targetId),
     });
-    res.json({ ok: true, callId });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result);
+  });
+
+  // HTTP fallback for WebRTC call signaling (works over SSE or during brief WS reconnects)
+  router.post("/calls/signal", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const body = (req.body ?? {}) as {
+      targetId?: string;
+      callId?: string;
+      action?: string;
+      sdp?: unknown;
+      candidate?: unknown;
+      cameraEnabled?: boolean;
+      micMuted?: boolean;
+      reason?: string;
+    };
+    const result = await forwardCallSignal({
+      userId: me.id,
+      targetId: String(body.targetId ?? ""),
+      callId: String(body.callId ?? ""),
+      action: String(body.action ?? ""),
+      sdp: body.sdp ?? null,
+      candidate: body.candidate ?? null,
+      cameraEnabled: body.cameraEnabled,
+      micMuted: body.micMuted,
+      reason: body.reason,
+    });
+    if (!result.ok) {
+      res.status(result.status ?? 400).json({ error: result.error ?? "Signal failed." });
+      return;
+    }
+    res.json({ ok: true, delivered: result.delivered });
   });
 
   // Protected per-user reading progress, bookmarks, favorites & history sync

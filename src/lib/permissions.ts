@@ -12,6 +12,7 @@ export async function requestFeatureMediaPermission(
 }
 
 export type AppPermissionState = "granted" | "denied" | "prompt" | "unsupported";
+export type PermissionStateValue = AppPermissionState;
 
 export type PermissionSnapshot = Record<AppPermissionKind, AppPermissionState>;
 

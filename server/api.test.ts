@@ -31,6 +31,7 @@ test.before(async () => {
 });
 
 test.after(async () => {
+  server.closeAllConnections?.();
   await new Promise<void>((resolve) => server.close(() => resolve()));
   fs.rmSync(testDataDir, { recursive: true, force: true });
 });
@@ -1558,5 +1559,260 @@ test("Cookie+Bearer auth fallback, newest-first pagination, Secret/Normal galler
   } finally {
     wsCookieA.ws.close();
     wsB.ws.close();
+  }
+});
+
+async function connectSse(token: string) {
+  const controller = new AbortController();
+  const resp = await fetch(`${baseUrl}/events`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Accept: "text/event-stream",
+    },
+    signal: controller.signal,
+  });
+  assert.equal(resp.status, 200);
+  const reader = resp.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const queue: Array<{ event: string; payload: Record<string, unknown> }> = [];
+  const waiters: Array<{
+    event: string;
+    done: (payload: Record<string, unknown>) => void;
+  }> = [];
+
+  void (async () => {
+    try {
+      while (!controller.signal.aborted) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const blocks = buffer.split(/\r?\n\r?\n/);
+        buffer = blocks.pop() ?? "";
+        for (const block of blocks) {
+          const dataLines = block
+            .split(/\r?\n/)
+            .filter((l) => l.startsWith("data:"))
+            .map((l) => l.slice(5).trim());
+          if (dataLines.length === 0) continue;
+          const parsed = JSON.parse(dataLines.join("\n")) as {
+            event?: string;
+            payload?: Record<string, unknown>;
+          };
+          if (!parsed.event) continue;
+          const idx = waiters.findIndex((w) => w.event === parsed.event);
+          if (idx >= 0) {
+            waiters.splice(idx, 1)[0]?.done(parsed.payload ?? {});
+          } else {
+            queue.push({ event: parsed.event, payload: parsed.payload ?? {} });
+          }
+        }
+      }
+    } catch {
+      /* aborted on test cleanup */
+    }
+  })();
+
+  const waitForEvent = (name: string, timeoutMs = 2000) => {
+    const idx = queue.findIndex((item) => item.event === name);
+    if (idx >= 0) return Promise.resolve(queue.splice(idx, 1)[0]!.payload);
+    return new Promise<Record<string, unknown>>((resolve, reject) => {
+      const t = setTimeout(
+        () => reject(new Error(`Timed out waiting for SSE '${name}'`)),
+        timeoutMs,
+      );
+      waiters.push({
+        event: name,
+        done: (payload) => {
+          clearTimeout(t);
+          resolve(payload);
+        },
+      });
+    });
+  };
+
+  return {
+    waitForEvent,
+    close: () => controller.abort(),
+  };
+}
+
+test("SSE realtime fallback delivers messages instantaneously and generates ephemeral TURN ICE credentials", async () => {
+  const regA = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "SSE Sender",
+      username: "sse_sender",
+      email: "sse.sender@example.com",
+      password: "Password123!",
+    },
+  });
+  const regB = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "SSE Receiver",
+      username: "sse_receiver",
+      email: "sse.receiver@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regA.status, 201);
+  assert.equal(regB.status, 201);
+
+  const sseB = await connectSse(regB.data.token);
+  try {
+    await sseB.waitForEvent("connected");
+    const activeRes = await api<{ ok: boolean }>("/thread/active", {
+      method: "POST",
+      token: regB.data.token,
+      body: { peerId: regA.data.user.id },
+    });
+    assert.equal(activeRes.status, 200);
+
+    const startedAt = Date.now();
+    const incomingPromise = sseB.waitForEvent("message:new", 1500);
+    const sendRes = await api<{
+      message: { id: string; text: string; deliveredAt: string | null };
+    }>("/messages", {
+      method: "POST",
+      token: regA.data.token,
+      body: { peerId: regB.data.user.id, text: "Instant SSE delivery test" },
+    });
+    assert.equal(sendRes.status, 201);
+    assert.ok(sendRes.data.message.deliveredAt, "expected immediate deliveredAt over SSE");
+
+    const evt = await incomingPromise;
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal((evt["message"] as { text?: string })?.text, "Instant SSE delivery test");
+    assert.ok(elapsedMs < 1000, `Expected <1000ms SSE delivery, took ${elapsedMs}ms`);
+  } finally {
+    sseB.close();
+  }
+
+  // ICE servers endpoint requires authentication and issues HMAC ephemeral TURN creds without leaking secret
+  const unauthIce = await api("/calls/ice-servers");
+  assert.equal(unauthIce.status, 401);
+
+  const prevUrls = process.env["TURN_URLS"];
+  const prevSecret = process.env["TURN_SECRET"];
+  process.env["TURN_URLS"] =
+    "turn:turn.readingcorner.example:3478?transport=udp,turns:turn.readingcorner.example:5349?transport=tcp";
+  process.env["TURN_SECRET"] = "super_secret_coturn_key_do_not_expose";
+  try {
+    const iceRes = await api<{
+      iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }>;
+      turnConfigured: boolean;
+      ttlSeconds: number;
+    }>("/calls/ice-servers", { token: regA.data.token });
+    assert.equal(iceRes.status, 200);
+    assert.equal(iceRes.data.turnConfigured, true);
+    assert.ok(iceRes.data.ttlSeconds >= 60);
+    const turnEntry = iceRes.data.iceServers.find((s) =>
+      (Array.isArray(s.urls) ? s.urls : [s.urls]).some((u) => String(u).startsWith("turn:")),
+    );
+    assert.ok(turnEntry);
+    assert.match(turnEntry.username ?? "", /^\d+:[a-f0-9]{12}$/);
+    assert.equal(turnEntry.username?.includes(regA.data.user.id), false);
+    assert.ok(
+      turnEntry.credential && turnEntry.credential !== "super_secret_coturn_key_do_not_expose",
+    );
+    assert.equal(
+      JSON.stringify(iceRes.data).includes("super_secret_coturn_key_do_not_expose"),
+      false,
+    );
+  } finally {
+    if (prevUrls === undefined) delete process.env["TURN_URLS"];
+    else process.env["TURN_URLS"] = prevUrls;
+    if (prevSecret === undefined) delete process.env["TURN_SECRET"];
+    else process.env["TURN_SECRET"] = prevSecret;
+  }
+});
+
+test("HTTP call signaling fallback and WS disconnect grace-period preserve calls and replay buffered signals", async () => {
+  const regCaller = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Grace Caller",
+      username: "grace_caller",
+      email: "grace.caller@example.com",
+      password: "Password123!",
+    },
+  });
+  const regCallee = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Grace Callee",
+      username: "grace_callee",
+      email: "grace.callee@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regCaller.status, 201);
+  assert.equal(regCallee.status, 201);
+
+  const calleeSse = await connectSse(regCallee.data.token);
+  const callerWs1 = await connectWs(regCaller.data.token);
+  await Promise.all([calleeSse.waitForEvent("connected"), callerWs1.waitForEvent("connected")]);
+
+  try {
+    // 1. Initiate call via HTTP API; callee receives call:incoming over SSE
+    const callId = "call_http_grace_1";
+    const incomingPromise = calleeSse.waitForEvent("call:incoming", 2000);
+    const initRes = await api<{ ok: boolean; callId: string; recipientOnline: boolean }>(
+      "/calls/initiate",
+      {
+        method: "POST",
+        token: regCaller.data.token,
+        body: { callId, targetId: regCallee.data.user.id, callType: "video" },
+      },
+    );
+    assert.equal(initRes.status, 200);
+    assert.equal(initRes.data.recipientOnline, true);
+    const incomingEvt = await incomingPromise;
+    assert.equal(incomingEvt["callId"], callId);
+
+    // 2. Caller WS drops briefly (e.g. mobile permission modal / network switch); callee must NOT receive ended
+    callerWs1.ws.close();
+    await new Promise((r) => setTimeout(r, 80));
+
+    // Callee accepts via HTTP /calls/signal while caller socket is offline -> server buffers accepted
+    const acceptRes = await api<{ ok: boolean }>("/calls/signal", {
+      method: "POST",
+      token: regCallee.data.token,
+      body: { targetId: regCaller.data.user.id, callId, action: "accepted" },
+    });
+    assert.equal(acceptRes.status, 200);
+
+    // 3. Caller reconnects within grace window and receives buffered accepted signal
+    const callerWs2 = await connectWs(regCaller.data.token);
+    try {
+      await callerWs2.waitForEvent("connected");
+      const replayedAccept = await callerWs2.waitForEvent("call:signal", 2000);
+      assert.equal(replayedAccept["callId"], callId);
+      assert.equal(replayedAccept["action"], "accepted");
+
+      // Cleanly end call
+      const endPromise = calleeSse.waitForEvent("call:signal", 2000);
+      await api("/calls/signal", {
+        method: "POST",
+        token: regCaller.data.token,
+        body: { targetId: regCallee.data.user.id, callId, action: "ended" },
+      });
+      const endEvt = await endPromise;
+      assert.equal(endEvt["action"], "ended");
+    } finally {
+      callerWs2.ws.close();
+    }
+
+    // 4. Call initiation respects missing user (404) & blocks (403)
+    const missingRes = await api("/calls/initiate", {
+      method: "POST",
+      token: regCaller.data.token,
+      body: { targetId: "nonexistent_user_id", callType: "audio" },
+    });
+    assert.equal(missingRes.status, 404);
+  } finally {
+    calleeSse.close();
+    callerWs1.ws.close();
   }
 });

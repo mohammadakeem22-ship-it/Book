@@ -24,6 +24,11 @@ export type CallSignalMessage = {
   reason?: string;
 };
 
+export type CallClientOptions = {
+  getIceServers?: () => Promise<RTCIceServer[]>;
+  sendSignal?: (event: string, payload: Record<string, unknown>) => Promise<boolean>;
+};
+
 type Session = {
   callId: string;
   kind: Kind;
@@ -86,7 +91,21 @@ function createSilentAudioStream(): MediaStream {
   return new MediaStream();
 }
 
-async function acquireInitialMedia(kind: Kind, facingMode: FacingMode): Promise<MediaStream> {
+function getErrorName(err: unknown): string {
+  return err && typeof err === "object" && "name" in err
+    ? String((err as { name: unknown }).name)
+    : "";
+}
+
+function isPermissionOrSecurityError(name: string): boolean {
+  return name === "NotAllowedError" || name === "PermissionDeniedError" || name === "SecurityError";
+}
+
+async function acquireInitialMedia(
+  kind: Kind,
+  facingMode: FacingMode,
+  notify: (msg: string) => void,
+): Promise<MediaStream> {
   const audioConstraints: MediaTrackConstraints = {
     echoCancellation: true,
     noiseSuppression: true,
@@ -107,27 +126,64 @@ async function acquireInitialMedia(kind: Kind, facingMode: FacingMode): Promise<
       video: videoConstraints,
     });
   } catch (err) {
-    const name =
-      err && typeof err === "object" && "name" in err ? (err as { name: string }).name : "";
-    if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
-      return await navigator.mediaDevices.getUserMedia({
-        audio: true,
-        video: kind === "video",
-      });
+    const name = getErrorName(err);
+    // Never mask explicit permission denial or insecure-context errors!
+    if (isPermissionOrSecurityError(name)) {
+      throw err;
     }
+
+    if (name === "OverconstrainedError" || name === "ConstraintNotSatisfiedError") {
+      try {
+        return await navigator.mediaDevices.getUserMedia({
+          audio: true,
+          video: kind === "video",
+        });
+      } catch (relaxedErr) {
+        if (isPermissionOrSecurityError(getErrorName(relaxedErr))) {
+          throw relaxedErr;
+        }
+      }
+    }
+
+    // If video camera hardware is missing or busy in another app, allow audio-only fallback with a clear notice
+    if (
+      kind === "video" &&
+      (name === "NotFoundError" ||
+        name === "DevicesNotFoundError" ||
+        name === "NotReadableError" ||
+        name === "TrackStartError" ||
+        name === "OverconstrainedError" ||
+        name === "ConstraintNotSatisfiedError")
+    ) {
+      try {
+        const audioOnly = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+        notify("Camera unavailable — continuing with audio only.");
+        return audioOnly;
+      } catch (audioErr) {
+        if (isPermissionOrSecurityError(getErrorName(audioErr))) {
+          throw audioErr;
+        }
+      }
+    }
+
     if (name === "NotFoundError" || name === "DevicesNotFoundError") {
       if (kind === "video") {
         try {
           const videoOnly = await navigator.mediaDevices.getUserMedia({ video: true });
           const silent = createSilentAudioStream();
           silent.getAudioTracks().forEach((t) => videoOnly.addTrack(t));
+          notify("No microphone detected — you can listen and share video.");
           return videoOnly;
-        } catch {
-          // Fall through to error
+        } catch (vidErr) {
+          if (isPermissionOrSecurityError(getErrorName(vidErr))) {
+            throw vidErr;
+          }
         }
-      } else {
-        const silent = createSilentAudioStream();
-        if (silent.getAudioTracks().length > 0) return silent;
+      }
+      const silent = createSilentAudioStream();
+      if (silent.getAudioTracks().length > 0) {
+        notify("No microphone detected — listen-only mode enabled.");
+        return silent;
       }
     }
     throw err;
@@ -140,8 +196,19 @@ export function createCallClient(
   render: (value: { incomingCall: IncomingCall | null; outgoingCall: OutgoingCall | null }) => void,
   notify: (message: string) => void,
   waitForConnection: () => Promise<boolean>,
+  options: CallClientOptions = {},
 ) {
   let current: Session | undefined;
+
+  function emitSignal(event: string, payload: Record<string, unknown>): Promise<boolean> {
+    if (sendWs(event, payload)) {
+      return Promise.resolve(true);
+    }
+    if (options.sendSignal) {
+      return options.sendSignal(event, payload).catch(() => false);
+    }
+    return Promise.resolve(false);
+  }
 
   function display(s: Session) {
     if (current !== s || !s.target) return;
@@ -175,7 +242,7 @@ export function createCallClient(
     clearTimeout(s.timer);
     clearTimeout(s.reconnectTimer);
     if (notifyRemoteAction) {
-      sendWs("call:signal", {
+      void emitSignal("call:signal", {
         targetId: s.targetId,
         callId: s.callId,
         action: notifyRemoteAction,
@@ -184,6 +251,7 @@ export function createCallClient(
     if (s.peer) {
       s.peer.ontrack = null;
       s.peer.onicecandidate = null;
+      s.peer.onicecandidateerror = null;
       s.peer.onconnectionstatechange = null;
       s.peer.oniceconnectionstatechange = null;
       s.peer.onicegatheringstatechange = null;
@@ -219,7 +287,7 @@ export function createCallClient(
   }
 
   function sendMediaState(s: Session) {
-    sendWs("call:signal", {
+    void emitSignal("call:signal", {
       targetId: s.targetId,
       callId: s.callId,
       action: "media-state",
@@ -252,10 +320,19 @@ export function createCallClient(
 
     s.preparingMedia = true;
     try {
-      const local = await acquireInitialMedia(s.kind, s.facingMode);
+      const [local, fetchedIceServers] = await Promise.all([
+        acquireInitialMedia(s.kind, s.facingMode, notify),
+        options.getIceServers
+          ? options.getIceServers().catch(() => buildIceServers())
+          : Promise.resolve(buildIceServers()),
+      ]);
       if (current !== s) {
         local.getTracks().forEach((t) => t.stop());
         throw new Error("Call ended.");
+      }
+
+      if (s.kind === "video" && local.getVideoTracks().length === 0) {
+        s.cameraEnabled = false;
       }
 
       local.getAudioTracks().forEach((t) => {
@@ -266,15 +343,17 @@ export function createCallClient(
       });
 
       s.local = local;
-      s.canSwitchCamera = await detectCanSwitchCamera(s.kind);
+      s.canSwitchCamera =
+        local.getVideoTracks().length > 0 ? await detectCanSwitchCamera(s.kind) : false;
       if (current !== s) {
         local.getTracks().forEach((t) => t.stop());
         throw new Error("Call ended.");
       }
 
+      const iceServers = fetchedIceServers.length > 0 ? fetchedIceServers : buildIceServers();
       const pc = new RTCPeerConnection({
-        iceServers: buildIceServers(),
-        iceCandidatePoolSize: 6,
+        iceServers,
+        iceCandidatePoolSize: 4,
       });
       s.peer = pc;
 
@@ -282,12 +361,16 @@ export function createCallClient(
 
       pc.onicecandidate = (event) => {
         if (current !== s || !event.candidate) return;
-        sendWs("call:signal", {
+        void emitSignal("call:signal", {
           targetId: s.targetId,
           callId: s.callId,
           action: "ice-candidate",
           candidate: event.candidate.toJSON(),
         });
+      };
+
+      pc.onicecandidateerror = () => {
+        // Individual STUN/TURN server timeout is non-fatal when another server succeeds
       };
 
       pc.ontrack = (event) => {
@@ -337,7 +420,7 @@ export function createCallClient(
           finish(
             s,
             "ended",
-            "Call could not connect direct P2P (symmetric NAT or mobile firewall may block STUN). Configure a free/custom TURN relay via VITE_ICE_SERVERS_JSON or try Wi-Fi.",
+            "Call could not connect across networks. A TURN relay server may be required on restricted mobile or Wi-Fi networks.",
           );
           return;
         }
@@ -354,7 +437,7 @@ export function createCallClient(
                     .then((offer) => s.peer!.setLocalDescription(offer).then(() => offer))
                     .then((offer) => {
                       if (current !== s) return;
-                      sendWs("call:signal", {
+                      void emitSignal("call:signal", {
                         targetId: s.targetId,
                         callId: s.callId,
                         action: "offer",
@@ -389,7 +472,7 @@ export function createCallClient(
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
     if (current !== s) return;
-    sendWs("call:signal", {
+    await emitSignal("call:signal", {
       targetId: s.targetId,
       callId: s.callId,
       action: "answer",
@@ -413,14 +496,23 @@ export function createCallClient(
     handleIncoming(payload: { callId: string; callType: Kind; from: PublicAccount }) {
       if (!payload?.callId || !payload.from?.id) return;
       if (current) {
-        if (current.callId !== payload.callId) {
-          sendWs("call:signal", {
+        if (current.callId === payload.callId) return;
+        // If the user is genuinely engaged in an active answered conversation, signal busy
+        if (
+          current.status === "accepted" &&
+          current.peer &&
+          (current.peer.connectionState === "connected" ||
+            current.peer.iceConnectionState === "connected")
+        ) {
+          void emitSignal("call:signal", {
             targetId: payload.from.id,
             callId: payload.callId,
             action: "busy",
           });
+          return;
         }
-        return;
+        // Otherwise, previous session was abandoned or ringing out; finish it cleanly
+        finish(current, "ended");
       }
 
       const s: Session = {
@@ -457,7 +549,6 @@ export function createCallClient(
       if (!s || s.callId !== payload.callId) return;
       s.status = "ringing";
       if (!payload.recipientOnline) {
-        // Keep ringing for up to 30s to allow target's WebSocket to reconnect or page to focus
         timeout(
           s,
           30000,
@@ -514,7 +605,6 @@ export function createCallClient(
         display(s);
         timeout(s, 30000, "Call could not connect.");
         try {
-          // Wait briefly if caller's media/pc is still finishing initialization
           let waitTries = 0;
           while (!s.peer && s.preparingMedia && waitTries < 50 && current === s) {
             await new Promise((r) => setTimeout(r, 100));
@@ -528,7 +618,7 @@ export function createCallClient(
           });
           await pc.setLocalDescription(offer);
           if (current !== s) return;
-          sendWs("call:signal", {
+          await emitSignal("call:signal", {
             targetId: s.targetId,
             callId: s.callId,
             action: "offer",
@@ -580,7 +670,13 @@ export function createCallClient(
     },
 
     async dial(target: PublicAccount, kind: Kind) {
-      if (current) throw new Error("Finish the current call first.");
+      if (current) {
+        if (current.status !== "accepted") {
+          finish(current, "ended");
+        } else {
+          throw new Error("Finish the current call first.");
+        }
+      }
       const callId = `call_${crypto.randomUUID().replace(/-/g, "")}`;
       const s: Session = {
         callId,
@@ -606,30 +702,19 @@ export function createCallClient(
       timeout(s, 45000, "No answer.");
 
       try {
-        if (!(await waitForConnection())) {
-          throw new Error(
-            "Could not reconnect to real-time services. Check your connection and try again.",
-          );
-        }
+        // Trigger realtime reconnect in background if needed, without blocking HTTP signal fallback
+        void waitForConnection();
         await prepare(s);
         if (current !== s) return;
-        let sent = sendWs("call:initiate", {
+        const sent = await emitSignal("call:initiate", {
           callId: s.callId,
           targetId: target.id,
           callType: kind,
         });
         if (!sent) {
-          for (let i = 0; i < 8 && !sent && current === s; i++) {
-            await new Promise((r) => setTimeout(r, 250));
-            sent = sendWs("call:initiate", {
-              callId: s.callId,
-              targetId: target.id,
-              callType: kind,
-            });
-          }
-        }
-        if (!sent) {
-          throw new Error("Realtime connection is offline. Reconnect and try again.");
+          throw new Error(
+            "Could not reach the call signaling server. Check your connection and retry.",
+          );
         }
         s.status = "ringing";
         display(s);
@@ -661,20 +746,13 @@ export function createCallClient(
       try {
         const pc = await prepare(s);
         if (current !== s) return;
-        let sent = sendWs("call:signal", {
+        const sent = await emitSignal("call:signal", {
           targetId: s.targetId,
           callId: s.callId,
           action: "accepted",
         });
         if (!sent) {
-          for (let i = 0; i < 8 && !sent && current === s; i++) {
-            await new Promise((r) => setTimeout(r, 250));
-            sent = sendWs("call:signal", {
-              targetId: s.targetId,
-              callId: s.callId,
-              action: "accepted",
-            });
-          }
+          throw new Error("Could not send call acceptance. Check your connection and retry.");
         }
         sendMediaState(s);
         if (s.pendingOffer) {

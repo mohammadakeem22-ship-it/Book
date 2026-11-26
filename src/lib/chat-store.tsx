@@ -20,6 +20,7 @@ import {
 } from "./alerts";
 import { warmUpCallAudio } from "@/components/CallMedia";
 import { createCallClient, type CallSignalMessage } from "./call-client";
+import { buildIceServers } from "./call-peer";
 import { isActiveElementTextInput } from "./chat-viewport";
 import { compressAvatarDataUrl, getFirebaseAuth, googleProvider } from "@/lib/firebase";
 import type { SecretThemeId } from "@/lib/secret-themes";
@@ -299,7 +300,13 @@ let wsReconnectTimer: number | null = null;
 let wsPingTimer: number | null = null;
 let wsReconnectAttempt = 0;
 let wsConnectTimer: number | null = null;
+let wsConnectPromise: Promise<void> | null = null;
+let sseAbortController: AbortController | null = null;
+let sseReconnectTimer: number | null = null;
+let sseFallbackDelayTimer: number | null = null;
+let sseConnected = false;
 let callClient: ReturnType<typeof createCallClient> | undefined;
+let cachedIceServers: { servers: RTCIceServer[]; expiresAt: number } | null = null;
 
 const uploadedMediaMeta = new Map<string, { url: string; kind: MediaKind; name: string }>();
 const mediaBlobUrlCache = new Map<string, string>();
@@ -353,18 +360,33 @@ export function getCachedMediaObjectUrl(url: string | null | undefined): string 
   return mediaBlobUrlCache.get(url) ?? null;
 }
 
+export const AUTH_TOKEN_KEY = "rc_auth_token_v1";
+
+export async function getEffectiveAuthToken(): Promise<string | null> {
+  if (state.sessionToken && state.sessionToken.startsWith("rc_sess_")) {
+    return state.sessionToken;
+  }
+  if (typeof window !== "undefined") {
+    const stored = window.localStorage.getItem(AUTH_TOKEN_KEY);
+    if (stored && stored.startsWith("rc_sess_")) {
+      return stored;
+    }
+    const fbUser = getFirebaseAuth().currentUser;
+    if (fbUser) {
+      const idToken = await fbUser.getIdToken().catch(() => null);
+      if (idToken) return idToken;
+    }
+  }
+  return null;
+}
+
 export async function getBearerHeaders(
   extra?: Record<string, string>,
 ): Promise<Record<string, string>> {
   const headers: Record<string, string> = { ...(extra ?? {}) };
-  if (state.sessionToken && state.sessionToken.startsWith("rc_sess_")) {
-    headers["Authorization"] = `Bearer ${state.sessionToken}`;
-  } else if (typeof window !== "undefined") {
-    const fbUser = getFirebaseAuth().currentUser;
-    if (fbUser) {
-      const idToken = await fbUser.getIdToken().catch(() => null);
-      if (idToken) headers["Authorization"] = `Bearer ${idToken}`;
-    }
+  const token = await getEffectiveAuthToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
   }
   return headers;
 }
@@ -375,7 +397,14 @@ async function tryRefreshAuthSession(): Promise<string | null> {
 
   sessionRefreshPromise = (async () => {
     try {
-      const sessRes = await fetch("/api/auth/session", { credentials: "include" });
+      const storedToken = window.localStorage.getItem(AUTH_TOKEN_KEY);
+      const sessRes = await fetch("/api/auth/session", {
+        credentials: "include",
+        headers:
+          storedToken && storedToken.startsWith("rc_sess_")
+            ? { Authorization: `Bearer ${storedToken}` }
+            : {},
+      });
       if (sessRes.ok) {
         const sess = (await sessRes.json().catch(() => ({}))) as {
           authenticated?: boolean;
@@ -383,7 +412,10 @@ async function tryRefreshAuthSession(): Promise<string | null> {
           user?: PublicAccount | null;
         };
         if (sess.authenticated && sess.user) {
-          const nextToken = sess.token ?? state.sessionToken ?? "__cookie__";
+          const nextToken = sess.token ?? state.sessionToken ?? storedToken ?? "__cookie__";
+          if (nextToken && nextToken.startsWith("rc_sess_")) {
+            window.localStorage.setItem(AUTH_TOKEN_KEY, nextToken);
+          }
           setState({ me: sess.user, sessionToken: nextToken });
           return nextToken;
         }
@@ -405,6 +437,9 @@ async function tryRefreshAuthSession(): Promise<string | null> {
               user?: PublicAccount;
             };
             if (data.token && data.user) {
+              if (data.token.startsWith("rc_sess_")) {
+                window.localStorage.setItem(AUTH_TOKEN_KEY, data.token);
+              }
               setState({ me: data.user, sessionToken: data.token });
               return data.token;
             }
@@ -512,6 +547,26 @@ function sendWs(event: string, payload: Record<string, unknown>): boolean {
   return true;
 }
 
+function isRealtimeOpen(): boolean {
+  return Boolean((ws && ws.readyState === WebSocket.OPEN) || sseConnected);
+}
+
+function stopSseFallback() {
+  if (sseReconnectTimer) {
+    window.clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+  if (sseFallbackDelayTimer) {
+    window.clearTimeout(sseFallbackDelayTimer);
+    sseFallbackDelayTimer = null;
+  }
+  if (sseAbortController) {
+    sseAbortController.abort();
+    sseAbortController = null;
+  }
+  sseConnected = false;
+}
+
 function disconnectRealtime() {
   if (wsReconnectTimer) {
     window.clearTimeout(wsReconnectTimer);
@@ -525,6 +580,9 @@ function disconnectRealtime() {
     window.clearTimeout(wsConnectTimer);
     wsConnectTimer = null;
   }
+  stopSseFallback();
+  wsConnectPromise = null;
+  cachedIceServers = null;
   callClient?.dispose();
   callClient = undefined;
   if (ws) {
@@ -541,13 +599,46 @@ function disconnectRealtime() {
 }
 
 async function waitForRealtimeConnection(timeoutMs = 10_000): Promise<boolean> {
-  if (state.wsConnected && ws?.readyState === WebSocket.OPEN) return true;
-  connectRealtime();
+  if (isRealtimeOpen()) return true;
+  void connectRealtimeAsync();
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (state.wsConnected && ws?.readyState === WebSocket.OPEN) return true;
+    if (isRealtimeOpen()) return true;
     if (!state.me) return false;
     await new Promise((resolve) => window.setTimeout(resolve, 100));
+  }
+  return false;
+}
+
+async function fetchCallIceServers(): Promise<RTCIceServer[]> {
+  if (cachedIceServers && Date.now() < cachedIceServers.expiresAt) {
+    return cachedIceServers.servers;
+  }
+  try {
+    const data = await apiJson<{ iceServers?: RTCIceServer[]; ttlSeconds?: number }>(
+      "/api/calls/ice-servers",
+    );
+    const merged = buildIceServers(undefined, data.iceServers ?? []);
+    const ttlMs = Math.max(60_000, Math.min(3_600_000, Number(data.ttlSeconds ?? 300) * 800));
+    cachedIceServers = { servers: merged, expiresAt: Date.now() + ttlMs };
+    return merged;
+  } catch {
+    return buildIceServers();
+  }
+}
+
+async function sendCallSignalHttp(
+  event: string,
+  payload: Record<string, unknown>,
+): Promise<boolean> {
+  if (!state.me) return false;
+  if (event === "call:initiate") {
+    await apiJson("/api/calls/initiate", { method: "POST", body: payload });
+    return true;
+  }
+  if (event === "call:signal") {
+    await apiJson("/api/calls/signal", { method: "POST", body: payload });
+    return true;
   }
   return false;
 }
@@ -560,6 +651,10 @@ function ensureCallClient() {
       setState,
       (message) => toast(message),
       waitForRealtimeConnection,
+      {
+        getIceServers: fetchCallIceServers,
+        sendSignal: sendCallSignalHttp,
+      },
     );
   }
   return callClient;
@@ -697,303 +792,459 @@ function handleIncomingMessageEvent(msg: ChatMessage, sender?: PublicAccount) {
   }
 }
 
-function connectRealtime() {
+function handleRealtimeEvent(event: string | undefined, payload: Record<string, unknown>) {
+  if (!event || event === "pong" || event === "connected") return;
+
+  if (event === "presence:update") {
+    const userId = String(payload["userId"] ?? "");
+    const online = Boolean(payload["online"]);
+    const lastActiveAt = String(payload["lastActiveAt"] ?? new Date().toISOString());
+    setState({
+      discoveredUsers: state.discoveredUsers.map((u) =>
+        u.id === userId ? { ...u, online, lastActiveAt } : u,
+      ),
+      conversations: state.conversations.map((c) =>
+        c.peer.id === userId ? { ...c, peer: { ...c.peer, online, lastActiveAt } } : c,
+      ),
+    });
+    return;
+  }
+
+  if (event === "user:registered") {
+    const incomingUser = payload["user"] as PublicAccount | undefined;
+    if (incomingUser && incomingUser.id !== state.me?.id) {
+      const rest = state.discoveredUsers.filter((u) => u.id !== incomingUser.id);
+      setState({
+        discoveredUsers: dedupeUsersById(
+          filterAndSortUsers([incomingUser, ...rest], "", "all"),
+          state.me?.id,
+        ),
+      });
+    }
+    return;
+  }
+
+  if (event === "user:deleted") {
+    const deletedId = String(payload["userId"] ?? "");
+    setState({
+      discoveredUsers: state.discoveredUsers.filter((u) => u.id !== deletedId),
+      conversations: state.conversations.filter((c) => c.peer.id !== deletedId),
+    });
+    return;
+  }
+
+  if (event === "typing") {
+    const fromUserId = String(payload["fromUserId"] ?? "");
+    const active = Boolean(payload["active"]);
+    if (fromUserId) {
+      const prevTimer = typingTimers.get(fromUserId);
+      if (prevTimer) {
+        window.clearTimeout(prevTimer);
+        typingTimers.delete(fromUserId);
+      }
+      if (active && typeof window !== "undefined") {
+        const timeoutId = window.setTimeout(() => {
+          typingTimers.delete(fromUserId);
+          if (state.typingByPeer[fromUserId]) {
+            setState({
+              typingByPeer: { ...state.typingByPeer, [fromUserId]: false },
+            });
+          }
+        }, 4500);
+        typingTimers.set(fromUserId, timeoutId);
+      }
+      setState({
+        typingByPeer: { ...state.typingByPeer, [fromUserId]: active },
+      });
+    }
+    return;
+  }
+
+  if (event === "message:new") {
+    const msg = payload["message"] as ChatMessage | undefined;
+    const sender = payload["sender"] as PublicAccount | undefined;
+    if (msg) handleIncomingMessageEvent(msg, sender);
+    return;
+  }
+
+  if (event === "message:updated" || event === "message:deleted") {
+    const msg = payload["message"] as ChatMessage | undefined;
+    if (!msg || !state.me) return;
+    const peerId = msg.from === state.me.id ? msg.to : msg.from;
+    const thread = state.threads[peerId];
+    if (thread) {
+      setState({
+        threads: {
+          ...state.threads,
+          [peerId]: thread.map((m) => (m.id === msg.id ? msg : m)),
+        },
+      });
+    }
+    setState({
+      conversations: state.conversations.map((c) =>
+        c.peer.id === peerId && c.lastMessage?.id === msg.id ? { ...c, lastMessage: msg } : c,
+      ),
+    });
+    return;
+  }
+
+  if (event === "message:reaction") {
+    const messageId = String(payload["messageId"] ?? "");
+    const reactions = (payload["reactions"] as MessageReactionGroup[] | undefined) ?? [];
+    const nextThreads: Record<string, ChatMessage[]> = {};
+    let changed = false;
+    for (const [peerId, msgs] of Object.entries(state.threads)) {
+      if (msgs.some((m) => m.id === messageId)) {
+        changed = true;
+        nextThreads[peerId] = msgs.map((m) => (m.id === messageId ? { ...m, reactions } : m));
+      } else {
+        nextThreads[peerId] = msgs;
+      }
+    }
+    if (changed) setState({ threads: nextThreads });
+    return;
+  }
+
+  if (event === "messages:delivered") {
+    const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
+    const deliveredAt = String(payload["deliveredAt"] ?? new Date().toISOString());
+    const msgs = state.threads[peerId];
+    if (msgs && state.me) {
+      setState({
+        threads: {
+          ...state.threads,
+          [peerId]: msgs.map((m) =>
+            m.from === state.me!.id && !m.deliveredAt ? { ...m, deliveredAt } : m,
+          ),
+        },
+      });
+    }
+    return;
+  }
+
+  if (event === "messages:seen") {
+    const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
+    const seenAt = String(payload["seenAt"] ?? new Date().toISOString());
+    const msgs = state.threads[peerId];
+    if (msgs && state.me) {
+      setState({
+        threads: {
+          ...state.threads,
+          [peerId]: msgs.map((m) =>
+            m.from === state.me!.id && !m.seenAt
+              ? { ...m, seenAt, deliveredAt: m.deliveredAt ?? seenAt }
+              : m,
+          ),
+        },
+      });
+    }
+    setState({
+      conversations: state.conversations.map((c) =>
+        c.peer.id === peerId && c.lastMessage && !c.lastMessage.seenAt
+          ? { ...c, lastMessage: { ...c.lastMessage, seenAt } }
+          : c,
+      ),
+    });
+    return;
+  }
+
+  if (event === "follow:updated") {
+    const followerId = String(payload["followerId"] ?? "");
+    const followingId = String(payload["followingId"] ?? "");
+    const isFollowing = Boolean(payload["isFollowing"]);
+    const targetFollowerCount = payload["targetFollowerCount"];
+    const myFollowingCount = payload["myFollowingCount"];
+    setState({
+      me:
+        state.me && typeof myFollowingCount === "number"
+          ? { ...state.me, followingCount: myFollowingCount }
+          : state.me,
+      discoveredUsers: state.discoveredUsers.map((u) => {
+        if (u.id === followingId && followerId === state.me?.id) {
+          return {
+            ...u,
+            isFollowing,
+            ...(typeof targetFollowerCount === "number"
+              ? { followerCount: targetFollowerCount }
+              : {}),
+          };
+        }
+        if (u.id === followerId && followingId === state.me?.id) {
+          return { ...u, followsMe: isFollowing };
+        }
+        return u;
+      }),
+    });
+    return;
+  }
+
+  if (event === "block:updated") {
+    void loadConversations();
+    void discoverUsers();
+    void loadBlocks();
+    return;
+  }
+
+  if (event === "call:incoming") {
+    ensureCallClient().handleIncoming(
+      payload as unknown as {
+        callId: string;
+        callType: "audio" | "video";
+        from: PublicAccount;
+      },
+    );
+    return;
+  }
+
+  if (event === "call:ringing") {
+    ensureCallClient().handleRinging(
+      payload as unknown as {
+        callId: string;
+        targetId: string;
+        callType: "audio" | "video";
+        recipientOnline: boolean;
+      },
+    );
+    return;
+  }
+
+  if (event === "call:signal") {
+    void ensureCallClient().handleSignal(payload as unknown as CallSignalMessage);
+    return;
+  }
+
+  if (event === "call:error") {
+    ensureCallClient().handleCallError(payload as { error?: string });
+  }
+}
+
+async function connectSseFallback(): Promise<void> {
+  if (typeof window === "undefined" || !state.me) return;
+  if (ws && ws.readyState === WebSocket.OPEN) return;
+  if (sseAbortController) return;
+
+  if (sseReconnectTimer) {
+    window.clearTimeout(sseReconnectTimer);
+    sseReconnectTimer = null;
+  }
+
+  const controller = new AbortController();
+  sseAbortController = controller;
+
+  try {
+    const headers = await getBearerHeaders({ Accept: "text/event-stream" });
+    if (controller.signal.aborted || !state.me || (ws && ws.readyState === WebSocket.OPEN)) {
+      return;
+    }
+
+    let resp = await fetch("/api/events", {
+      headers,
+      credentials: "include",
+      signal: controller.signal,
+    });
+    if (resp.status === 401 && !controller.signal.aborted && state.me) {
+      const refreshed = await tryRefreshAuthSession();
+      if (refreshed && !controller.signal.aborted && state.me) {
+        resp = await fetch("/api/events", {
+          headers: await getBearerHeaders({ Accept: "text/event-stream" }),
+          credentials: "include",
+          signal: controller.signal,
+        });
+      }
+    }
+    if (!resp.ok || !resp.body || controller.signal.aborted || !state.me) {
+      throw new Error(`SSE stream failed (${resp.status})`);
+    }
+
+    sseConnected = true;
+    setState({ wsConnected: true });
+    if (state.activePeerId) {
+      void apiJson("/api/thread/active", {
+        method: "POST",
+        body: { peerId: state.activePeerId },
+      }).catch(() => {});
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (!controller.signal.aborted) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocks = buffer.split(/\r?\n\r?\n/);
+      buffer = blocks.pop() ?? "";
+      for (const block of blocks) {
+        const dataLines = block
+          .split(/\r?\n/)
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trim());
+        if (dataLines.length === 0) continue;
+        try {
+          const parsed = JSON.parse(dataLines.join("\n")) as {
+            event?: string;
+            payload?: Record<string, unknown>;
+          };
+          handleRealtimeEvent(parsed.event, parsed.payload ?? {});
+        } catch {
+          /* ignore malformed SSE event */
+        }
+      }
+    }
+  } catch {
+    /* SSE fallback error triggers retry below if still signed in */
+  } finally {
+    if (sseAbortController === controller) {
+      sseAbortController = null;
+      sseConnected = false;
+      setState({ wsConnected: Boolean(ws && ws.readyState === WebSocket.OPEN) });
+      if (!controller.signal.aborted && state.me && (!ws || ws.readyState !== WebSocket.OPEN)) {
+        sseReconnectTimer = window.setTimeout(() => {
+          sseReconnectTimer = null;
+          if (state.me && (!ws || ws.readyState !== WebSocket.OPEN)) {
+            void connectSseFallback();
+          }
+        }, 1500);
+      }
+    }
+  }
+}
+
+async function connectRealtimeAsync(): Promise<void> {
   if (typeof window === "undefined" || !state.me) return;
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
     return;
   }
+  if (wsConnectPromise) {
+    return wsConnectPromise;
+  }
 
-  ensureCallClient();
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const tokenQuery =
-    state.sessionToken && state.sessionToken.startsWith("rc_sess_")
-      ? `?token=${encodeURIComponent(state.sessionToken)}`
-      : "";
-  const socket = new WebSocket(`${proto}//${window.location.host}/ws${tokenQuery}`);
-  ws = socket;
-  if (wsConnectTimer) window.clearTimeout(wsConnectTimer);
-  wsConnectTimer = window.setTimeout(() => {
-    if (ws === socket && socket.readyState === WebSocket.CONNECTING) socket.close();
-  }, 12_000);
-
-  socket.onopen = () => {
-    if (wsConnectTimer) {
-      window.clearTimeout(wsConnectTimer);
-      wsConnectTimer = null;
-    }
-    wsReconnectAttempt = 0;
-    setState({ wsConnected: true });
-    if (wsPingTimer) window.clearInterval(wsPingTimer);
-    wsPingTimer = window.setInterval(() => {
-      if (document.visibilityState !== "hidden") {
-        sendWs("ping", {});
+  wsConnectPromise = (async () => {
+    ensureCallClient();
+    let effectiveToken = state.sessionToken;
+    if (!effectiveToken || !effectiveToken.startsWith("rc_sess_")) {
+      const resolved = await getEffectiveAuthToken();
+      if (!resolved) {
+        await (getFirebaseAuth().authStateReady?.() ?? Promise.resolve()).catch(() => {});
       }
-    }, 35_000);
-    if (state.activePeerId) {
-      sendWs("thread:active", { peerId: state.activePeerId });
-      void openThread(state.activePeerId);
-    }
-    void Promise.allSettled([loadConversations(), discoverUsers()]);
-  };
-
-  socket.onmessage = (evt) => {
-    try {
-      const parsed = JSON.parse(String(evt.data)) as {
-        event?: string;
-        payload?: Record<string, unknown>;
-      };
-      const event = parsed.event;
-      const payload = parsed.payload ?? {};
-
-      if (event === "presence:update") {
-        const userId = String(payload["userId"] ?? "");
-        const online = Boolean(payload["online"]);
-        const lastActiveAt = String(payload["lastActiveAt"] ?? new Date().toISOString());
-        setState({
-          discoveredUsers: state.discoveredUsers.map((u) =>
-            u.id === userId ? { ...u, online, lastActiveAt } : u,
-          ),
-          conversations: state.conversations.map((c) =>
-            c.peer.id === userId ? { ...c, peer: { ...c.peer, online, lastActiveAt } } : c,
-          ),
-        });
-        return;
-      }
-
-      if (event === "user:registered") {
-        const incomingUser = payload["user"] as PublicAccount | undefined;
-        if (incomingUser && incomingUser.id !== state.me?.id) {
-          const rest = state.discoveredUsers.filter((u) => u.id !== incomingUser.id);
-          setState({
-            discoveredUsers: dedupeUsersById(
-              filterAndSortUsers([incomingUser, ...rest], "", "all"),
-              state.me?.id,
-            ),
-          });
-        }
-        return;
-      }
-
-      if (event === "user:deleted") {
-        const deletedId = String(payload["userId"] ?? "");
-        setState({
-          discoveredUsers: state.discoveredUsers.filter((u) => u.id !== deletedId),
-          conversations: state.conversations.filter((c) => c.peer.id !== deletedId),
-        });
-        return;
-      }
-
-      if (event === "typing") {
-        const fromUserId = String(payload["fromUserId"] ?? "");
-        const active = Boolean(payload["active"]);
-        if (fromUserId) {
-          const prevTimer = typingTimers.get(fromUserId);
-          if (prevTimer) {
-            window.clearTimeout(prevTimer);
-            typingTimers.delete(fromUserId);
-          }
-          if (active && typeof window !== "undefined") {
-            const timeoutId = window.setTimeout(() => {
-              typingTimers.delete(fromUserId);
-              if (state.typingByPeer[fromUserId]) {
-                setState({
-                  typingByPeer: { ...state.typingByPeer, [fromUserId]: false },
-                });
-              }
-            }, 4500);
-            typingTimers.set(fromUserId, timeoutId);
-          }
-          setState({
-            typingByPeer: { ...state.typingByPeer, [fromUserId]: active },
-          });
-        }
-        return;
-      }
-
-      if (event === "message:new") {
-        const msg = payload["message"] as ChatMessage | undefined;
-        const sender = payload["sender"] as PublicAccount | undefined;
-        if (msg) handleIncomingMessageEvent(msg, sender);
-        return;
-      }
-
-      if (event === "message:updated" || event === "message:deleted") {
-        const msg = payload["message"] as ChatMessage | undefined;
-        if (!msg || !state.me) return;
-        const peerId = msg.from === state.me.id ? msg.to : msg.from;
-        const thread = state.threads[peerId];
-        if (thread) {
-          setState({
-            threads: {
-              ...state.threads,
-              [peerId]: thread.map((m) => (m.id === msg.id ? msg : m)),
-            },
-          });
-        }
-        setState({
-          conversations: state.conversations.map((c) =>
-            c.peer.id === peerId && c.lastMessage?.id === msg.id ? { ...c, lastMessage: msg } : c,
-          ),
-        });
-        return;
-      }
-
-      if (event === "message:reaction") {
-        const messageId = String(payload["messageId"] ?? "");
-        const reactions = (payload["reactions"] as MessageReactionGroup[] | undefined) ?? [];
-        const nextThreads: Record<string, ChatMessage[]> = {};
-        let changed = false;
-        for (const [peerId, msgs] of Object.entries(state.threads)) {
-          if (msgs.some((m) => m.id === messageId)) {
-            changed = true;
-            nextThreads[peerId] = msgs.map((m) => (m.id === messageId ? { ...m, reactions } : m));
-          } else {
-            nextThreads[peerId] = msgs;
-          }
-        }
-        if (changed) setState({ threads: nextThreads });
-        return;
-      }
-
-      if (event === "messages:delivered") {
-        const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
-        const deliveredAt = String(payload["deliveredAt"] ?? new Date().toISOString());
-        const msgs = state.threads[peerId];
-        if (msgs && state.me) {
-          setState({
-            threads: {
-              ...state.threads,
-              [peerId]: msgs.map((m) =>
-                m.from === state.me!.id && !m.deliveredAt ? { ...m, deliveredAt } : m,
-              ),
-            },
-          });
-        }
-        return;
-      }
-
-      if (event === "messages:seen") {
-        const peerId = String(payload["peerId"] ?? payload["byUserId"] ?? "");
-        const seenAt = String(payload["seenAt"] ?? new Date().toISOString());
-        const msgs = state.threads[peerId];
-        if (msgs && state.me) {
-          setState({
-            threads: {
-              ...state.threads,
-              [peerId]: msgs.map((m) =>
-                m.from === state.me!.id && !m.seenAt
-                  ? { ...m, seenAt, deliveredAt: m.deliveredAt ?? seenAt }
-                  : m,
-              ),
-            },
-          });
-        }
-        setState({
-          conversations: state.conversations.map((c) =>
-            c.peer.id === peerId && c.lastMessage && !c.lastMessage.seenAt
-              ? { ...c, lastMessage: { ...c.lastMessage, seenAt } }
-              : c,
-          ),
-        });
-        return;
-      }
-
-      if (event === "follow:updated") {
-        const followerId = String(payload["followerId"] ?? "");
-        const followingId = String(payload["followingId"] ?? "");
-        const isFollowing = Boolean(payload["isFollowing"]);
-        const targetFollowerCount = payload["targetFollowerCount"];
-        const myFollowingCount = payload["myFollowingCount"];
-        setState({
-          me:
-            state.me && typeof myFollowingCount === "number"
-              ? { ...state.me, followingCount: myFollowingCount }
-              : state.me,
-          discoveredUsers: state.discoveredUsers.map((u) => {
-            if (u.id === followingId && followerId === state.me?.id) {
-              return {
-                ...u,
-                isFollowing,
-                ...(typeof targetFollowerCount === "number"
-                  ? { followerCount: targetFollowerCount }
-                  : {}),
-              };
-            }
-            if (u.id === followerId && followingId === state.me?.id) {
-              return { ...u, followsMe: isFollowing };
-            }
-            return u;
-          }),
-        });
-        return;
-      }
-
-      if (event === "block:updated") {
-        void loadConversations();
-        void discoverUsers();
-        void loadBlocks();
-        return;
-      }
-
-      if (event === "call:incoming") {
-        ensureCallClient().handleIncoming(
-          payload as unknown as {
-            callId: string;
-            callType: "audio" | "video";
-            from: PublicAccount;
-          },
-        );
-        return;
-      }
-
-      if (event === "call:ringing") {
-        ensureCallClient().handleRinging(
-          payload as unknown as {
-            callId: string;
-            targetId: string;
-            callType: "audio" | "video";
-            recipientOnline: boolean;
-          },
-        );
-        return;
-      }
-
-      if (event === "call:signal") {
-        void ensureCallClient().handleSignal(payload as unknown as CallSignalMessage);
-        return;
-      }
-
-      if (event === "call:error") {
-        ensureCallClient().handleCallError(payload as { error?: string });
-      }
-    } catch {
-      /* ignore malformed frame */
-    }
-  };
-
-  socket.onclose = () => {
-    if (ws !== socket) return;
-    ws = null;
-    if (wsConnectTimer) {
-      window.clearTimeout(wsConnectTimer);
-      wsConnectTimer = null;
-    }
-    setState({ wsConnected: false });
-    if (wsPingTimer) {
-      window.clearInterval(wsPingTimer);
-      wsPingTimer = null;
-    }
-    const delay = Math.min(30_000, 750 * 2 ** wsReconnectAttempt++);
-    wsReconnectTimer = window.setTimeout(() => {
-      wsReconnectTimer = null;
+      effectiveToken = (await getEffectiveAuthToken()) ?? effectiveToken;
       if (!state.me) return;
-      void tryRefreshAuthSession().finally(connectRealtime);
-    }, delay);
-  };
+      if (effectiveToken && effectiveToken.startsWith("rc_sess_")) {
+        setState({ sessionToken: effectiveToken });
+      }
+    }
+
+    if (!state.me) return;
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+    const queryToken = effectiveToken && effectiveToken !== "__cookie__" ? effectiveToken : null;
+    const tokenQuery = queryToken ? `?token=${encodeURIComponent(queryToken)}` : "";
+    const socket = new WebSocket(`${proto}//${window.location.host}/ws${tokenQuery}`);
+    ws = socket;
+
+    if (wsConnectTimer) window.clearTimeout(wsConnectTimer);
+    wsConnectTimer = window.setTimeout(() => {
+      if (ws === socket && socket.readyState === WebSocket.CONNECTING) socket.close();
+    }, 10_000);
+
+    if (sseFallbackDelayTimer) window.clearTimeout(sseFallbackDelayTimer);
+    sseFallbackDelayTimer = window.setTimeout(() => {
+      sseFallbackDelayTimer = null;
+      if (state.me && (!ws || ws.readyState !== WebSocket.OPEN)) {
+        void connectSseFallback();
+      }
+    }, 1200);
+
+    socket.onopen = () => {
+      if (wsConnectTimer) {
+        window.clearTimeout(wsConnectTimer);
+        wsConnectTimer = null;
+      }
+      if (sseFallbackDelayTimer) {
+        window.clearTimeout(sseFallbackDelayTimer);
+        sseFallbackDelayTimer = null;
+      }
+      stopSseFallback();
+      wsReconnectAttempt = 0;
+      setState({ wsConnected: true });
+      if (wsPingTimer) window.clearInterval(wsPingTimer);
+      wsPingTimer = window.setInterval(() => {
+        sendWs("ping", {});
+      }, 20_000);
+      if (state.activePeerId) {
+        sendWs("thread:active", { peerId: state.activePeerId });
+        void openThread(state.activePeerId);
+      }
+      void Promise.allSettled([loadConversations(), discoverUsers()]);
+    };
+
+    socket.onmessage = (evt) => {
+      try {
+        const parsed = JSON.parse(String(evt.data)) as {
+          event?: string;
+          payload?: Record<string, unknown>;
+        };
+        handleRealtimeEvent(parsed.event, parsed.payload ?? {});
+      } catch {
+        /* ignore malformed frame */
+      }
+    };
+
+    socket.onclose = () => {
+      if (ws !== socket) return;
+      ws = null;
+      if (wsConnectTimer) {
+        window.clearTimeout(wsConnectTimer);
+        wsConnectTimer = null;
+      }
+      if (sseFallbackDelayTimer) {
+        window.clearTimeout(sseFallbackDelayTimer);
+        sseFallbackDelayTimer = null;
+      }
+      if (wsPingTimer) {
+        window.clearInterval(wsPingTimer);
+        wsPingTimer = null;
+      }
+      setState({ wsConnected: sseConnected });
+      if (state.me) {
+        void connectSseFallback();
+        const delay = Math.min(30_000, 750 * 2 ** wsReconnectAttempt++);
+        wsReconnectTimer = window.setTimeout(() => {
+          wsReconnectTimer = null;
+          if (!state.me) return;
+          void tryRefreshAuthSession().finally(connectRealtime);
+        }, delay);
+      }
+    };
+  })().finally(() => {
+    wsConnectPromise = null;
+  });
+
+  return wsConnectPromise;
+}
+
+function connectRealtime() {
+  void connectRealtimeAsync();
 }
 
 async function hydrateAuthenticatedSession(user: PublicAccount, token?: string | null) {
-  const sessionToken = token ?? state.sessionToken ?? "__cookie__";
+  let effectiveToken = token ?? state.sessionToken;
+  if (!effectiveToken || effectiveToken === "__cookie__") {
+    if (typeof window !== "undefined") {
+      const stored = window.localStorage.getItem(AUTH_TOKEN_KEY);
+      if (stored && stored.startsWith("rc_sess_")) {
+        effectiveToken = stored;
+      }
+    }
+  }
+  const sessionToken = effectiveToken ?? "__cookie__";
+  if (typeof window !== "undefined" && sessionToken.startsWith("rc_sess_")) {
+    window.localStorage.setItem(AUTH_TOKEN_KEY, sessionToken);
+  }
   setState({
     ready: true,
     me: user,
@@ -1010,6 +1261,9 @@ async function hydrateAuthenticatedSession(user: PublicAccount, token?: string |
 }
 
 function resetLocalSessionState() {
+  if (typeof window !== "undefined") {
+    window.localStorage.removeItem(AUTH_TOKEN_KEY);
+  }
   clearMediaBlobCache();
   disconnectRealtime();
   cursorByPeer.clear();
@@ -1081,11 +1335,19 @@ function bootstrap() {
 
   void (async () => {
     try {
+      const storedToken =
+        typeof window !== "undefined" ? window.localStorage.getItem(AUTH_TOKEN_KEY) : null;
       const [healthRes, sessionRes] = await Promise.all([
         fetch("/api/health")
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})),
-        fetch("/api/auth/session", { credentials: "include" })
+        fetch("/api/auth/session", {
+          credentials: "include",
+          headers:
+            storedToken && storedToken.startsWith("rc_sess_")
+              ? { Authorization: `Bearer ${storedToken}` }
+              : {},
+        })
           .then((r) => r.json())
           .catch(() => ({
             authenticated: false,
@@ -1927,7 +2189,12 @@ export function dismissIncomingMessageAlert() {
 }
 
 export async function openThread(peerId: string | null, options: { markSeen?: boolean } = {}) {
-  sendWs("thread:active", { peerId: peerId ?? "" });
+  if (!sendWs("thread:active", { peerId: peerId ?? "" }) && sseConnected && state.me) {
+    void apiJson("/api/thread/active", {
+      method: "POST",
+      body: { peerId: peerId ?? "" },
+    }).catch(() => {});
+  }
   setState({
     activePeerId: peerId,
     hasOlderMessages: peerId ? Boolean(hasOlderByPeer.get(peerId)) : false,
@@ -2518,8 +2785,7 @@ export async function initiateCall(target: PublicAccount, kind: "audio" | "video
   warmUpCallAudio();
   const client = ensureCallClient();
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    connectRealtime();
-    await new Promise((r) => setTimeout(r, 350));
+    await connectRealtimeAsync();
   }
   await client.dial(target, kind);
 }

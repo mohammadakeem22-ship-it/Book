@@ -328,6 +328,7 @@ export function InstagramChatView({
     typingByPeer,
     gallery,
     soundEnabled,
+    wsConnected,
   } = useChat();
 
   const [query, setQuery] = useState("");
@@ -409,13 +410,14 @@ export function InstagramChatView({
       }
     };
 
-    const intervalId = window.setInterval(syncActiveThread, 4000);
+    const intervalMs = wsConnected ? 15_000 : 2_500;
+    const intervalId = window.setInterval(syncActiveThread, intervalMs);
     document.addEventListener("visibilitychange", syncActiveThread);
     return () => {
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", syncActiveThread);
     };
-  }, [activePeerId]);
+  }, [activePeerId, wsConnected]);
 
   useEffect(() => {
     const syncConversations = () => {
@@ -424,13 +426,14 @@ export function InstagramChatView({
       }
     };
 
-    const intervalId = window.setInterval(syncConversations, 10000);
+    const intervalMs = wsConnected ? 20_000 : 6_000;
+    const intervalId = window.setInterval(syncConversations, intervalMs);
     document.addEventListener("visibilitychange", syncConversations);
     return () => {
       window.clearInterval(intervalId);
       document.removeEventListener("visibilitychange", syncConversations);
     };
-  }, []);
+  }, [wsConnected]);
 
   useEffect(() => {
     setReplyingTo(null);
@@ -992,20 +995,6 @@ export function InstagramChatView({
   async function handleStartCall(callType: "audio" | "video") {
     if (!activePeer) return;
     try {
-      const microphone = await requestFeatureMediaPermission("microphone");
-      if (microphone === "denied") {
-        toast.info(
-          "Microphone access is blocked in site settings. Allow microphone access in your browser and retry.",
-        );
-        return;
-      }
-      if (callType === "video") {
-        const camera = await requestFeatureMediaPermission("camera");
-        if (camera === "denied") {
-          toast.info("Camera access is blocked. You can still place an audio call.");
-          return;
-        }
-      }
       await initiateCall(activePeer, callType);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Cannot initiate call.");
