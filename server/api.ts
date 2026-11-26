@@ -47,6 +47,7 @@ import {
   broadcastEvent,
   forwardCallSignal,
   getCallInvitationStatus,
+  getCallSignalsForUser,
   getPendingIncomingCallsForUser,
   getUserAliases,
   initiateCallSession,
@@ -4616,18 +4617,37 @@ export function createApiRouter() {
     res.json(result);
   });
 
-  // HTTP fallback for retrieving pending incoming calls & signals when WS/SSE missed delivery
+  // HTTP fallback for retrieving pending incoming calls & durable sequential signals
   router.get("/calls/pending", requireAuth, async (req: AuthedRequest, res) => {
     const me = req.authUser!;
     const activeCallId =
       typeof req.query["activeCallId"] === "string" ? req.query["activeCallId"].trim() : "";
+    const sinceSeqRaw = Number(req.query["sinceSeq"]);
+    const sinceSeq = Number.isFinite(sinceSeqRaw) && sinceSeqRaw > 0 ? Math.floor(sinceSeqRaw) : 0;
     const drainSignals = req.query["drainSignals"] === "1" || req.query["drainSignals"] === "true";
 
     const calls = await getPendingIncomingCallsForUser(me.id);
     const activeCallStatus = activeCallId
       ? await getCallInvitationStatus(activeCallId, me.id)
       : null;
-    const signals = drainSignals ? popBufferedSignalsForUser(me.id, activeCallId || undefined) : [];
+
+    const durableSignals = activeCallId
+      ? await getCallSignalsForUser(me.id, activeCallId, sinceSeq)
+      : [];
+    const bufferedSignals = drainSignals
+      ? popBufferedSignalsForUser(me.id, activeCallId || undefined)
+      : [];
+
+    const seenSeq = new Set<number>();
+    const signals: Record<string, unknown>[] = [];
+    for (const sig of [...durableSignals, ...bufferedSignals]) {
+      const seq = Number(sig["seq"]);
+      if (Number.isFinite(seq) && seq > 0) {
+        if (seenSeq.has(seq)) continue;
+        seenSeq.add(seq);
+      }
+      signals.push(sig);
+    }
 
     res.json({
       calls,

@@ -108,8 +108,8 @@ export function RemoteCallAudio({
   }, [speakerOn]);
 
   useEffect(() => {
+    const el = audioRef.current;
     return () => {
-      const el = audioRef.current;
       if (el) {
         el.srcObject = null;
       }
@@ -117,14 +117,27 @@ export function RemoteCallAudio({
     };
   }, []);
 
+  const resumeAudio = () => {
+    const el = audioRef.current;
+    if (!el || !speakerOn || !el.srcObject) return;
+    el.muted = false;
+    el.volume = 1;
+    void el
+      .play()
+      .then(() => setAutoplayBlocked(false))
+      .catch(() => setAutoplayBlocked(true));
+  };
+
   return (
     <>
       <audio
         ref={audioRef}
         aria-label="Remote call audio"
-        className="hidden"
+        className="sr-only pointer-events-none"
         autoPlay
         playsInline
+        onLoadedMetadata={resumeAudio}
+        onCanPlay={resumeAudio}
         onPlaying={() => setAutoplayBlocked(false)}
       />
       {autoplayBlocked && stream && stream.getAudioTracks().length > 0 && (
@@ -168,6 +181,12 @@ export function RemoteCallVideo({
   const attachedTrackKeyRef = useRef<string>("");
   const [hasLiveVideo, setHasLiveVideo] = useState(false);
 
+  const hasVideoTrack = Boolean(
+    stream &&
+    remoteCameraEnabled !== false &&
+    stream.getVideoTracks().some((t) => t.readyState !== "ended"),
+  );
+
   useEffect(() => {
     const el = videoRef.current;
     if (!el || !stream || remoteCameraEnabled === false) {
@@ -181,14 +200,6 @@ export function RemoteCallVideo({
     }
 
     const videoTracks = stream.getVideoTracks().filter((t) => t.readyState !== "ended");
-    const syncState = () => {
-      const trackActive = videoTracks.some((t) => t.readyState === "live" && t.enabled);
-      const hasFrames = el.videoWidth > 0 || el.readyState >= 2;
-      const active = trackActive && (hasFrames || !videoTracks.every((t) => t.muted));
-      setHasLiveVideo(active);
-      onHasVideoChange?.(active);
-    };
-
     if (videoTracks.length === 0) {
       attachedTrackKeyRef.current = "";
       el.srcObject = null;
@@ -207,11 +218,32 @@ export function RemoteCallVideo({
     }
 
     el.muted = true;
+    let pollTimer: number | null = null;
+
+    const syncState = () => {
+      const trackActive = videoTracks.some((t) => t.readyState === "live" && t.enabled);
+      const hasFrames = el.videoWidth > 0 || el.readyState >= 2;
+      const active = trackActive && (hasFrames || !videoTracks.every((t) => t.muted));
+      setHasLiveVideo(active);
+      onHasVideoChange?.(active);
+      if (active && pollTimer !== null) {
+        window.clearInterval(pollTimer);
+        pollTimer = null;
+      }
+    };
+
     const ensurePlay = () => {
       void el.play().catch(() => {});
       syncState();
     };
     ensurePlay();
+
+    pollTimer = window.setInterval(() => {
+      if (el.paused) {
+        void el.play().catch(() => {});
+      }
+      syncState();
+    }, 300);
 
     videoTracks.forEach((t) => {
       t.addEventListener("unmute", ensurePlay);
@@ -220,6 +252,9 @@ export function RemoteCallVideo({
     });
 
     return () => {
+      if (pollTimer !== null) {
+        window.clearInterval(pollTimer);
+      }
       videoTracks.forEach((t) => {
         t.removeEventListener("unmute", ensurePlay);
         t.removeEventListener("mute", syncState);
@@ -229,8 +264,8 @@ export function RemoteCallVideo({
   }, [stream, streamVersion, remoteCameraEnabled, onHasVideoChange]);
 
   useEffect(() => {
+    const el = videoRef.current;
     return () => {
-      const el = videoRef.current;
       if (el) el.srcObject = null;
       attachedTrackKeyRef.current = "";
     };
@@ -246,6 +281,14 @@ export function RemoteCallVideo({
       onLoadedMetadata={() => {
         const el = videoRef.current;
         if (el) void el.play().catch(() => {});
+      }}
+      onCanPlay={() => {
+        const el = videoRef.current;
+        if (el) void el.play().catch(() => {});
+        if (remoteCameraEnabled !== false) {
+          setHasLiveVideo(true);
+          onHasVideoChange?.(true);
+        }
       }}
       onLoadedData={() => {
         if (remoteCameraEnabled !== false) {
@@ -270,7 +313,9 @@ export function RemoteCallVideo({
         "size-full bg-black object-contain md:object-cover transition-opacity duration-300",
         hasLiveVideo && remoteCameraEnabled !== false
           ? "opacity-100"
-          : "opacity-0 pointer-events-none",
+          : hasVideoTrack
+            ? "opacity-[0.01] pointer-events-none"
+            : "opacity-0 pointer-events-none",
         className,
       )}
     />

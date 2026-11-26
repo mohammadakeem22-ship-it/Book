@@ -8,6 +8,7 @@ export type CallSignalMessage = {
   fromUserId?: string;
   targetId?: string;
   callId: string;
+  seq?: number;
   action:
     | "accepted"
     | "declined"
@@ -43,6 +44,10 @@ type Session = {
   remote?: MediaStream | undefined;
   pendingCandidates: RTCIceCandidateInit[];
   pendingOffer?: RTCSessionDescriptionInit | null | undefined;
+  seenSeqs: Set<number>;
+  appliedOfferSdps: Set<string>;
+  appliedAnswerSdps: Set<string>;
+  addedIceKeys: Set<string>;
   streamVersion: number;
   micMuted: boolean;
   cameraEnabled: boolean;
@@ -353,11 +358,18 @@ export function createCallClient(
       });
 
       s.local = local;
+      const hasVideoTrack = local.getVideoTracks().length > 0;
       s.canSwitchCamera =
-        local.getVideoTracks().length > 0 ? await detectCanSwitchCamera(s.kind) : false;
-      if (current !== s) {
-        local.getTracks().forEach((t) => t.stop());
-        throw new Error("Call ended.");
+        hasVideoTrack &&
+        typeof navigator !== "undefined" &&
+        /android|iphone|ipad|ipod|mobile/i.test(navigator.userAgent ?? "");
+      if (hasVideoTrack) {
+        void detectCanSwitchCamera(s.kind).then((can) => {
+          if (current === s && can !== s.canSwitchCamera) {
+            s.canSwitchCamera = can;
+            display(s);
+          }
+        });
       }
 
       const iceServers = fetchedIceServers.length > 0 ? fetchedIceServers : buildIceServers();
@@ -368,6 +380,9 @@ export function createCallClient(
       s.peer = pc;
 
       local.getTracks().forEach((t) => pc.addTrack(t, local));
+      if (s.kind === "video" && !hasVideoTrack && typeof pc.addTransceiver === "function") {
+        pc.addTransceiver("video", { direction: "recvonly" });
+      }
 
       pc.onicecandidate = (event) => {
         if (current !== s || !event.candidate) return;
@@ -477,6 +492,10 @@ export function createCallClient(
     pc: RTCPeerConnection,
     sdp: RTCSessionDescriptionInit,
   ) {
+    const sdpKey = sdp.sdp ?? "";
+    if (sdpKey && s.appliedOfferSdps.has(sdpKey)) return;
+    if (sdpKey) s.appliedOfferSdps.add(sdpKey);
+
     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
     await flushPendingCandidates(s, pc);
     const answer = await pc.createAnswer();
@@ -536,6 +555,10 @@ export function createCallClient(
         remoteAccepted: false,
         preparingMedia: false,
         pendingCandidates: [],
+        seenSeqs: new Set<number>(),
+        appliedOfferSdps: new Set<string>(),
+        appliedAnswerSdps: new Set<string>(),
+        addedIceKeys: new Set<string>(),
         streamVersion: 0,
         micMuted: false,
         cameraEnabled: payload.callType === "video",
@@ -583,6 +606,11 @@ export function createCallClient(
     async handleSignal(payload: CallSignalMessage) {
       const s = current;
       if (!s || payload.callId !== s.callId) return;
+
+      if (typeof payload.seq === "number" && Number.isFinite(payload.seq) && payload.seq > 0) {
+        if (s.seenSeqs.has(payload.seq)) return;
+        s.seenSeqs.add(payload.seq);
+      }
 
       if (payload.action === "declined") {
         finish(s, undefined, "Call declined.");
@@ -658,6 +686,10 @@ export function createCallClient(
 
       if (payload.action === "answer" && payload.sdp) {
         if (!s.peer) return;
+        const sdpKey = payload.sdp.sdp ?? "";
+        if (sdpKey && s.appliedAnswerSdps.has(sdpKey)) return;
+        if (s.peer.signalingState && s.peer.signalingState !== "have-local-offer") return;
+        if (sdpKey) s.appliedAnswerSdps.add(sdpKey);
         try {
           await s.peer.setRemoteDescription(new RTCSessionDescription(payload.sdp));
           await flushPendingCandidates(s, s.peer);
@@ -668,6 +700,9 @@ export function createCallClient(
       }
 
       if (payload.action === "ice-candidate" && payload.candidate) {
+        const candKey = JSON.stringify(payload.candidate);
+        if (s.addedIceKeys.has(candKey)) return;
+        s.addedIceKeys.add(candKey);
         if (s.peer && s.peer.remoteDescription) {
           try {
             await s.peer.addIceCandidate(new RTCIceCandidate(payload.candidate));
@@ -699,6 +734,10 @@ export function createCallClient(
         remoteAccepted: false,
         preparingMedia: false,
         pendingCandidates: [],
+        seenSeqs: new Set<number>(),
+        appliedOfferSdps: new Set<string>(),
+        appliedAnswerSdps: new Set<string>(),
+        addedIceKeys: new Set<string>(),
         streamVersion: 0,
         micMuted: false,
         cameraEnabled: kind === "video",

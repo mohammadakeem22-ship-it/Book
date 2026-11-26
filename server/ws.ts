@@ -51,6 +51,13 @@ type BufferedSignal = {
   createdAt: number;
 };
 
+type FallbackCallSignal = {
+  seq: number;
+  targetAliases: Set<string>;
+  payload: Record<string, unknown>;
+  createdAt: number;
+};
+
 export type PendingCallInvitation = {
   callId: string;
   callType: "audio" | "video";
@@ -79,7 +86,9 @@ const userSseClients = new Map<string, Set<SseClient>>();
 const activeCallPeers = new Map<string, ActiveCall>();
 const pendingCallOffers = new Map<string, PendingCallOffer>();
 const pendingSignalsByUser = new Map<string, BufferedSignal[]>();
+const fallbackCallSignalsByCall = new Map<string, FallbackCallSignal[]>();
 const disconnectCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let fallbackSignalSeq = 0;
 
 async function persistCallInvitation(offer: PendingCallOffer) {
   const createdIso = new Date(offer.createdAt).toISOString();
@@ -152,6 +161,55 @@ export function pruneStaleCalls() {
       pendingSignalsByUser.set(key, fresh);
     }
   }
+  for (const [callId, list] of fallbackCallSignalsByCall.entries()) {
+    const fresh = list.filter((item) => now - item.createdAt <= SIGNAL_BUFFER_TTL_MS);
+    if (fresh.length === 0) {
+      fallbackCallSignalsByCall.delete(callId);
+    } else if (fresh.length !== list.length) {
+      fallbackCallSignalsByCall.set(callId, fresh);
+    }
+  }
+}
+
+async function persistCallSignal(input: {
+  callId: string;
+  senderId: string;
+  targetId: string;
+  action: string;
+  payload: Record<string, unknown>;
+}): Promise<number> {
+  const nowIso = new Date().toISOString();
+  const json = JSON.stringify(input.payload);
+  try {
+    const row = (await db
+      .prepare(
+        `INSERT INTO call_signals (call_id, sender_id, target_id, action, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         RETURNING seq`,
+      )
+      .get(input.callId, input.senderId, input.targetId, input.action, json, nowIso)) as
+      { seq: number | string } | undefined;
+    if (row && Number.isFinite(Number(row.seq))) {
+      return Number(row.seq);
+    }
+  } catch {
+    /* Graceful fallback to in-memory signal log if DB table is unavailable */
+  }
+  fallbackSignalSeq += 1;
+  const seq = fallbackSignalSeq;
+  const payloadWithSeq = { ...input.payload, seq };
+  const list = fallbackCallSignalsByCall.get(input.callId) ?? [];
+  list.push({
+    seq,
+    targetAliases: new Set(getUserAliases(input.targetId)),
+    payload: payloadWithSeq,
+    createdAt: Date.now(),
+  });
+  if (list.length > 120) {
+    list.splice(0, list.length - 120);
+  }
+  fallbackCallSignalsByCall.set(input.callId, list);
+  return seq;
 }
 
 export function getUserAliases(userId: string): string[] {
@@ -684,6 +742,75 @@ export function popBufferedSignalsForUser(
   return out;
 }
 
+export async function getCallSignalsForUser(
+  userId: string,
+  callId: string,
+  sinceSeq = 0,
+): Promise<Record<string, unknown>[]> {
+  pruneStaleCalls();
+  if (!callId) return [];
+  const aliases = getUserAliases(userId);
+  if (aliases.length === 0) return [];
+  const aliasSet = new Set(aliases);
+
+  try {
+    const inv = (await db
+      .prepare("SELECT caller_id, target_id FROM call_invitations WHERE call_id = ? LIMIT 1")
+      .get(callId)) as { caller_id: string; target_id: string } | undefined;
+    if (inv) {
+      const isParticipant =
+        getUserAliases(inv.caller_id).some((a) => aliasSet.has(a)) ||
+        getUserAliases(inv.target_id).some((a) => aliasSet.has(a));
+      if (!isParticipant) return [];
+      if (await isBlockedBetween(inv.caller_id, inv.target_id)) return [];
+    }
+  } catch {
+    /* ignore DB lookup errors */
+  }
+
+  const out: Record<string, unknown>[] = [];
+  try {
+    const placeholders = aliases.map(() => "?").join(",");
+    const rows = (await db
+      .prepare(
+        `SELECT seq, sender_id, payload_json
+         FROM call_signals
+         WHERE call_id = ? AND target_id IN (${placeholders}) AND seq > ?
+         ORDER BY seq ASC`,
+      )
+      .all(callId, ...aliases, sinceSeq)) as Array<{
+      seq: number | string;
+      sender_id: string;
+      payload_json: string;
+    }>;
+
+    for (const row of rows) {
+      if (await isBlockedBetween(userId, row.sender_id)) continue;
+      try {
+        const parsed = JSON.parse(row.payload_json) as Record<string, unknown>;
+        parsed["seq"] = Number(row.seq);
+        out.push(parsed);
+      } catch {
+        /* ignore malformed row */
+      }
+    }
+    if (out.length > 0) return out;
+  } catch {
+    /* Fallback cleanly to in-memory signal store below */
+  }
+
+  const memList = fallbackCallSignalsByCall.get(callId) ?? [];
+  for (const item of memList) {
+    if (item.seq <= sinceSeq) continue;
+    if (!aliases.some((a) => item.targetAliases.has(a))) continue;
+    const fromUserId =
+      typeof item.payload["fromUserId"] === "string" ? item.payload["fromUserId"] : "";
+    if (fromUserId && (await isBlockedBetween(userId, fromUserId))) continue;
+    out.push(item.payload);
+  }
+  return out;
+}
+
 function deliverPendingForUser(userId: string) {
   pruneStaleCalls();
   cancelDisconnectGraceTimers(userId);
@@ -1010,7 +1137,7 @@ export async function forwardCallSignal(input: {
     }
   }
 
-  const signalPayload: Record<string, unknown> = {
+  const basePayload: Record<string, unknown> = {
     fromUserId: input.userId,
     callId,
     action,
@@ -1019,6 +1146,19 @@ export async function forwardCallSignal(input: {
     cameraEnabled: typeof input.cameraEnabled === "boolean" ? input.cameraEnabled : undefined,
     micMuted: typeof input.micMuted === "boolean" ? input.micMuted : undefined,
     reason: typeof input.reason === "string" ? input.reason : undefined,
+  };
+
+  const seq = await persistCallSignal({
+    callId,
+    senderId: input.userId,
+    targetId,
+    action,
+    payload: basePayload,
+  });
+
+  const signalPayload: Record<string, unknown> = {
+    ...basePayload,
+    seq,
   };
 
   const delivered = sendToUser(targetId, "call:signal", signalPayload);

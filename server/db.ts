@@ -248,6 +248,17 @@ function getLocalDb(): Database.Database {
     );
     CREATE INDEX IF NOT EXISTS idx_call_invitations_target_status
       ON call_invitations(target_id, status, expires_at);
+    CREATE TABLE IF NOT EXISTS call_signals (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT,
+      call_id TEXT NOT NULL,
+      sender_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      action TEXT NOT NULL,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_signals_call_target_seq
+      ON call_signals(call_id, target_id, seq);
   `);
 
   ensureColumns(localDb, "media_objects", [

@@ -1898,3 +1898,115 @@ test("Pending incoming calls persist across missed/stale sockets, deliver on /ca
     calleeWs2.ws.close();
   }
 });
+
+test("Durable sequential call signals deliver accepted/offer/answer/ice in order via sinceSeq even when sockets look connected", async () => {
+  const regA = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Seq Caller",
+      username: "seq_caller",
+      email: "seq.caller@example.com",
+      password: "Password123!",
+    },
+  });
+  const regB = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Seq Callee",
+      username: "seq_callee",
+      email: "seq.callee@example.com",
+      password: "Password123!",
+    },
+  });
+  const regC = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Seq Outsider",
+      username: "seq_outsider",
+      email: "seq.outsider@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regA.status, 201);
+  assert.equal(regB.status, 201);
+  assert.equal(regC.status, 201);
+
+  const wsA = await connectWs(regA.data.token);
+  const wsB = await connectWs(regB.data.token);
+  await Promise.all([wsA.waitForEvent("connected"), wsB.waitForEvent("connected")]);
+
+  try {
+    const callId = "call_seq_order_1";
+    const initRes = await api<{ ok: boolean }>("/calls/initiate", {
+      method: "POST",
+      token: regA.data.token,
+      body: { callId, targetId: regB.data.user.id, callType: "video" },
+    });
+    assert.equal(initRes.status, 200);
+
+    // Callee accepts even with open WS (simulating half-open WS on peer side)
+    const acceptRes = await api<{ ok: boolean }>("/calls/signal", {
+      method: "POST",
+      token: regB.data.token,
+      body: { targetId: regA.data.user.id, callId, action: "accepted" },
+    });
+    assert.equal(acceptRes.status, 200);
+
+    // Caller polls durable /calls/pending and still receives 'accepted' with monotonic seq
+    const pollA1 = await api<{
+      signals?: Array<{ seq?: number; action: string; callId: string }>;
+    }>(`/calls/pending?activeCallId=${encodeURIComponent(callId)}`, { token: regA.data.token });
+    assert.equal(pollA1.status, 200);
+    assert.equal(pollA1.data.signals?.length, 1);
+    assert.equal(pollA1.data.signals?.[0]?.action, "accepted");
+    const seq1 = pollA1.data.signals?.[0]?.seq ?? 0;
+    assert.ok(seq1 > 0);
+
+    // Callee sends answer + ICE candidate; caller polls with sinceSeq=seq1
+    await api("/calls/signal", {
+      method: "POST",
+      token: regB.data.token,
+      body: {
+        targetId: regA.data.user.id,
+        callId,
+        action: "answer",
+        sdp: { type: "answer", sdp: "v=0\r\nm=audio 9\r\n" },
+      },
+    });
+    await api("/calls/signal", {
+      method: "POST",
+      token: regB.data.token,
+      body: {
+        targetId: regA.data.user.id,
+        callId,
+        action: "ice-candidate",
+        candidate: { candidate: "candidate:2 1 udp 2122260223 192.0.2.1 55555 typ srflx" },
+      },
+    });
+
+    const pollA2 = await api<{
+      signals?: Array<{ seq?: number; action: string }>;
+    }>(`/calls/pending?activeCallId=${encodeURIComponent(callId)}&sinceSeq=${seq1}`, {
+      token: regA.data.token,
+    });
+    assert.equal(pollA2.status, 200);
+    assert.deepEqual(
+      pollA2.data.signals?.map((s) => s.action),
+      ["answer", "ice-candidate"],
+    );
+    const seq2 = pollA2.data.signals?.[1]?.seq ?? 0;
+    assert.ok(seq2 > seq1);
+
+    // Third user cannot read signals for this call
+    const outsiderPoll = await api<{
+      activeCallStatus?: string;
+      signals?: Array<unknown>;
+    }>(`/calls/pending?activeCallId=${encodeURIComponent(callId)}`, { token: regC.data.token });
+    assert.equal(outsiderPoll.status, 200);
+    assert.equal(outsiderPoll.data.activeCallStatus, undefined);
+    assert.equal(outsiderPoll.data.signals, undefined);
+  } finally {
+    wsA.ws.close();
+    wsB.ws.close();
+  }
+});

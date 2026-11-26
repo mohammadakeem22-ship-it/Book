@@ -46,7 +46,9 @@ class FakeRTCPeerConnection {
   iceGatheringState: RTCIceGatheringState = "complete";
   localDescription: RTCSessionDescriptionInit | null = null;
   remoteDescription: RTCSessionDescriptionInit | null = null;
+  signalingState: RTCSignalingState = "stable";
   addedCandidates: RTCIceCandidateInit[] = [];
+  transceivers: Array<{ kind: string; init?: RTCRtpTransceiverInit }> = [];
   closed = false;
 
   ontrack: ((ev: { streams?: FakeMediaStream[]; track?: FakeTrack }) => void) | null = null;
@@ -65,6 +67,9 @@ class FakeRTCPeerConnection {
   addTrack(track: FakeTrack) {
     this.senders.push({ track });
   }
+  addTransceiver(kind: string, init?: RTCRtpTransceiverInit) {
+    this.transceivers.push({ kind, init });
+  }
   getSenders() {
     return this.senders;
   }
@@ -76,9 +81,14 @@ class FakeRTCPeerConnection {
   }
   async setLocalDescription(desc: RTCSessionDescriptionInit) {
     this.localDescription = desc;
+    this.signalingState = desc.type === "offer" ? "have-local-offer" : "stable";
   }
   async setRemoteDescription(desc: RTCSessionDescriptionInit) {
+    if (desc.type === "answer" && this.signalingState !== "have-local-offer") {
+      throw new Error("InvalidStateError: Called in wrong state: stable");
+    }
     this.remoteDescription = desc;
+    this.signalingState = desc.type === "offer" ? "have-remote-offer" : "stable";
   }
   async addIceCandidate(c: RTCIceCandidateInit) {
     this.addedCandidates.push(c);
@@ -366,6 +376,69 @@ test("call-client handleIncoming deduplicates repeated deliveries and ignores de
     });
     assert.equal(rendered[rendered.length - 1]?.incomingCall, null);
     assert.equal(client.getActiveCallSnapshot(), null);
+
+    client.dispose();
+  } finally {
+    restore();
+  }
+});
+
+test("call-client deduplicates repeated seq/answer/ice signals and adds recvonly video transceiver when camera is missing", async () => {
+  const restore = installWebRtcGlobals(async (constraints) => {
+    if (constraints.video) {
+      throw Object.assign(new Error("Camera not found"), { name: "NotFoundError" });
+    }
+    return new FakeMediaStream([new FakeTrack("audio")]);
+  });
+
+  try {
+    const notices: string[] = [];
+    const sent: Array<{ event: string; payload: Record<string, unknown> }> = [];
+    const client = createCallClient(
+      (event, payload) => {
+        sent.push({ event, payload });
+        return true;
+      },
+      async () => samplePeer,
+      () => {},
+      (msg) => notices.push(msg),
+      async () => true,
+    );
+
+    await client.dial(samplePeer, "video");
+    const init = sent.find((s) => s.event === "call:initiate");
+    const callId = String(init?.payload["callId"]);
+    const pc = FakeRTCPeerConnection.instances[0]!;
+    assert.deepEqual(pc.transceivers, [{ kind: "video", init: { direction: "recvonly" } }]);
+
+    await client.handleSignal({ callId, seq: 1, action: "accepted" });
+    // Duplicate answer arriving both via WS and HTTP sync must NOT throw InvalidStateError or abort call
+    await client.handleSignal({
+      callId,
+      seq: 2,
+      action: "answer",
+      sdp: { type: "answer", sdp: "v=0\r\nm=audio 9\r\n" },
+    });
+    await client.handleSignal({
+      callId,
+      action: "answer",
+      sdp: { type: "answer", sdp: "v=0\r\nm=audio 9\r\n" },
+    });
+
+    await client.handleSignal({
+      callId,
+      seq: 3,
+      action: "ice-candidate",
+      candidate: { candidate: "candidate:1 1 udp 2122260223 198.51.100.2 50000 typ relay" },
+    });
+    await client.handleSignal({
+      callId,
+      seq: 3,
+      action: "ice-candidate",
+      candidate: { candidate: "candidate:1 1 udp 2122260223 198.51.100.2 50000 typ relay" },
+    });
+    assert.equal(pc.addedCandidates.length, 1);
+    assert.ok(client.getActiveCallSnapshot(), "call must stay alive after duplicate signals");
 
     client.dispose();
   } finally {

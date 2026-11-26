@@ -306,9 +306,11 @@ let sseReconnectTimer: number | null = null;
 let sseFallbackDelayTimer: number | null = null;
 let sseConnected = false;
 let pendingCallsPollTimer: number | null = null;
+let activeCallSyncTimer: number | null = null;
 let pendingCallsSyncInFlight = false;
 let callClient: ReturnType<typeof createCallClient> | undefined;
 let cachedIceServers: { servers: RTCIceServer[]; expiresAt: number } | null = null;
+const lastSignalSeqByCall = new Map<string, number>();
 
 const uploadedMediaMeta = new Map<string, { url: string; kind: MediaKind; name: string }>();
 const mediaBlobUrlCache = new Map<string, string>();
@@ -569,7 +571,39 @@ function stopSseFallback() {
   sseConnected = false;
 }
 
+function stopActiveCallSync() {
+  if (activeCallSyncTimer) {
+    window.clearInterval(activeCallSyncTimer);
+    activeCallSyncTimer = null;
+  }
+}
+
+function ensureActiveCallSync() {
+  if (typeof window === "undefined" || activeCallSyncTimer) return;
+  activeCallSyncTimer = window.setInterval(() => {
+    if (!state.me) {
+      stopActiveCallSync();
+      return;
+    }
+    const active = callClient?.getActiveCallSnapshot() ?? null;
+    if (
+      !active ||
+      (active.status !== "preparing" &&
+        active.status !== "ringing" &&
+        active.status !== "connecting" &&
+        active.status !== "reconnecting")
+    ) {
+      stopActiveCallSync();
+      return;
+    }
+    if (document.visibilityState !== "hidden") {
+      void syncPendingIncomingCalls();
+    }
+  }, 350);
+}
+
 function stopPendingCallsPolling() {
+  stopActiveCallSync();
   if (pendingCallsPollTimer) {
     window.clearInterval(pendingCallsPollTimer);
     pendingCallsPollTimer = null;
@@ -581,11 +615,12 @@ function startPendingCallsPolling() {
   pendingCallsPollTimer = window.setInterval(() => {
     if (!state.me || document.visibilityState === "hidden") return;
     void syncPendingIncomingCalls();
-  }, 2000);
+  }, 1200);
 }
 
 function disconnectRealtime() {
   stopPendingCallsPolling();
+  lastSignalSeqByCall.clear();
   if (wsReconnectTimer) {
     window.clearTimeout(wsReconnectTimer);
     wsReconnectTimer = null;
@@ -653,6 +688,10 @@ async function syncPendingIncomingCalls(): Promise<void> {
     const params = new URLSearchParams();
     if (active?.callId) {
       params.set("activeCallId", active.callId);
+      const sinceSeq = lastSignalSeqByCall.get(active.callId) ?? 0;
+      if (sinceSeq > 0) {
+        params.set("sinceSeq", String(sinceSeq));
+      }
       if (!isRealtimeOpen()) {
         params.set("drainSignals", "1");
       }
@@ -674,10 +713,22 @@ async function syncPendingIncomingCalls(): Promise<void> {
       }
     }
     if (Array.isArray(data.signals)) {
+      let maxSeq = active?.callId ? (lastSignalSeqByCall.get(active.callId) ?? 0) : 0;
       for (const sig of data.signals) {
         if (sig?.callId && sig.action) {
+          if (
+            active?.callId &&
+            sig.callId === active.callId &&
+            typeof sig.seq === "number" &&
+            sig.seq > maxSeq
+          ) {
+            maxSeq = sig.seq;
+          }
           void client.handleSignal(sig);
         }
+      }
+      if (active?.callId && maxSeq > (lastSignalSeqByCall.get(active.callId) ?? 0)) {
+        lastSignalSeqByCall.set(active.callId, maxSeq);
       }
     }
     if (
@@ -719,6 +770,7 @@ async function sendCallSignalHttp(
         recipientOnline: res.recipientOnline,
       });
     }
+    ensureActiveCallSync();
     return true;
   }
   if (event === "call:signal") {
@@ -731,7 +783,9 @@ async function sendCallSignalHttp(
 function ensureCallClient() {
   if (!callClient) {
     callClient = createCallClient(
-      sendWs,
+      // Route call signaling through authenticated HTTP endpoints (which persist to DB + push WS/SSE/FCM)
+      // so half-open mobile/Cloud Run WebSockets never silently swallow call offers/answers/ICE.
+      () => false,
       fetchUserProfile,
       setState,
       (message) => toast(message),
@@ -1349,6 +1403,7 @@ async function hydrateAuthenticatedSession(user: PublicAccount, token?: string |
     fetchGallery(),
     loadBlocks(),
     syncPendingIncomingCalls(),
+    fetchCallIceServers(),
   ]);
 }
 
@@ -2879,8 +2934,9 @@ export async function initiateCall(target: PublicAccount, kind: "audio" | "video
   warmUpCallAudio();
   const client = ensureCallClient();
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    await connectRealtimeAsync();
+    connectRealtime();
   }
+  ensureActiveCallSync();
   await client.dial(target, kind);
 }
 
@@ -2891,8 +2947,13 @@ export function respondToCall(
 ) {
   if (action === "accepted") {
     warmUpCallAudio();
+    ensureActiveCallSync();
   }
-  void callClient?.respond(id, action);
+  void callClient?.respond(id, action).then(() => {
+    if (action === "accepted") {
+      void syncPendingIncomingCalls();
+    }
+  });
 }
 
 export function setCallMicMuted(muted: boolean) {
