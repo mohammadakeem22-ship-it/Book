@@ -46,10 +46,13 @@ import {
 import {
   broadcastEvent,
   forwardCallSignal,
+  getCallInvitationStatus,
+  getPendingIncomingCallsForUser,
   getUserAliases,
   initiateCallSession,
   isUserConnected,
   isUserViewingThread,
+  popBufferedSignalsForUser,
   registerSseClient,
   resolveUserFromRequest,
   sendToUser,
@@ -4611,6 +4614,26 @@ export function createApiRouter() {
       return;
     }
     res.json(result);
+  });
+
+  // HTTP fallback for retrieving pending incoming calls & signals when WS/SSE missed delivery
+  router.get("/calls/pending", requireAuth, async (req: AuthedRequest, res) => {
+    const me = req.authUser!;
+    const activeCallId =
+      typeof req.query["activeCallId"] === "string" ? req.query["activeCallId"].trim() : "";
+    const drainSignals = req.query["drainSignals"] === "1" || req.query["drainSignals"] === "true";
+
+    const calls = await getPendingIncomingCallsForUser(me.id);
+    const activeCallStatus = activeCallId
+      ? await getCallInvitationStatus(activeCallId, me.id)
+      : null;
+    const signals = drainSignals ? popBufferedSignalsForUser(me.id, activeCallId || undefined) : [];
+
+    res.json({
+      calls,
+      ...(activeCallStatus ? { activeCallStatus } : {}),
+      ...(signals.length > 0 ? { signals } : {}),
+    });
   });
 
   // HTTP fallback for WebRTC call signaling (works over SSE or during brief WS reconnects)

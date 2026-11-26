@@ -323,3 +323,52 @@ test("call-client terminates cleanly with clear message when ICE connection fail
     restore();
   }
 });
+
+test("call-client handleIncoming deduplicates repeated deliveries and ignores declined calls on subsequent polls", async () => {
+  const restore = installWebRtcGlobals(async () => new FakeMediaStream([new FakeTrack("audio")]));
+
+  try {
+    const rendered: Array<{ incomingCall: { callId: string } | null; outgoingCall: unknown }> = [];
+    const client = createCallClient(
+      () => true,
+      async () => samplePeer,
+      (v) => rendered.push(v as { incomingCall: { callId: string } | null; outgoingCall: unknown }),
+      () => {},
+      async () => true,
+    );
+
+    client.handleIncoming({
+      callId: "call_dup_1",
+      callType: "audio",
+      from: samplePeer,
+    });
+    assert.equal(rendered.length, 1);
+    assert.equal(rendered[0]?.incomingCall?.callId, "call_dup_1");
+    assert.equal(client.getActiveCallSnapshot()?.callId, "call_dup_1");
+
+    // Duplicate delivery of the same callId (e.g. from both WS and HTTP poll) must be ignored
+    client.handleIncoming({
+      callId: "call_dup_1",
+      callType: "audio",
+      from: samplePeer,
+    });
+    assert.equal(rendered.length, 1);
+
+    await client.respond("call_dup_1", "declined");
+    assert.equal(rendered[rendered.length - 1]?.incomingCall, null);
+    assert.equal(client.getActiveCallSnapshot(), null);
+
+    // Delayed poll arriving right after user declined must NOT re-open the incoming call modal
+    client.handleIncoming({
+      callId: "call_dup_1",
+      callType: "audio",
+      from: samplePeer,
+    });
+    assert.equal(rendered[rendered.length - 1]?.incomingCall, null);
+    assert.equal(client.getActiveCallSnapshot(), null);
+
+    client.dispose();
+  } finally {
+    restore();
+  }
+});

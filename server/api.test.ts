@@ -1816,3 +1816,85 @@ test("HTTP call signaling fallback and WS disconnect grace-period preserve calls
     callerWs1.ws.close();
   }
 });
+
+test("Pending incoming calls persist across missed/stale sockets, deliver on /calls/pending and reconnect, and clear on decline", async () => {
+  const regA = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Persistent Caller",
+      username: "persist_caller",
+      email: "persist.caller@example.com",
+      password: "Password123!",
+    },
+  });
+  const regB = await api<{ token: string; user: { id: string } }>("/auth/register", {
+    method: "POST",
+    body: {
+      fullName: "Persistent Callee",
+      username: "persist_callee",
+      email: "persist.callee@example.com",
+      password: "Password123!",
+    },
+  });
+  assert.equal(regA.status, 201);
+  assert.equal(regB.status, 201);
+
+  // Connect B briefly, initiate call while B has an open WS, then simulate B reconnecting or polling via HTTP
+  const calleeWs1 = await connectWs(regB.data.token);
+  await calleeWs1.waitForEvent("connected");
+
+  const callId = "call_persist_ring_1";
+  try {
+    const incomingPromise = calleeWs1.waitForEvent("call:incoming", 2000);
+    const initRes = await api<{ ok: boolean; callId: string }>("/calls/initiate", {
+      method: "POST",
+      token: regA.data.token,
+      body: { callId, targetId: regB.data.user.id, callType: "audio" },
+    });
+    assert.equal(initRes.status, 200);
+    await incomingPromise;
+
+    // Even after push to calleeWs1, the ringing offer must remain queryable via GET /calls/pending until answered/declined/ended
+    const pendingHttp = await api<{
+      calls: Array<{ callId: string; callType: string; from: { id: string; fullName: string } }>;
+    }>("/calls/pending", { token: regB.data.token });
+    assert.equal(pendingHttp.status, 200);
+    assert.equal(pendingHttp.data.calls.length, 1);
+    assert.equal(pendingHttp.data.calls[0]?.callId, callId);
+    assert.equal(pendingHttp.data.calls[0]?.from.id, regA.data.user.id);
+    assert.equal(pendingHttp.data.calls[0]?.from.fullName, "Persistent Caller");
+  } finally {
+    calleeWs1.ws.close();
+  }
+
+  // Simulate callee reconnecting on a fresh WebSocket -> still receives call:incoming because offer wasn't deleted prematurely
+  const calleeWs2 = await connectWs(regB.data.token);
+  try {
+    await calleeWs2.waitForEvent("connected");
+    const replayedIncoming = await calleeWs2.waitForEvent("call:incoming", 2000);
+    assert.equal(replayedIncoming["callId"], callId);
+
+    // Callee declines via /calls/signal -> removed from /calls/pending and activeCallStatus reports declined
+    const declineRes = await api<{ ok: boolean }>("/calls/signal", {
+      method: "POST",
+      token: regB.data.token,
+      body: { targetId: regA.data.user.id, callId, action: "declined" },
+    });
+    assert.equal(declineRes.status, 200);
+
+    const afterDecline = await api<{
+      calls: Array<{ callId: string }>;
+      activeCallStatus?: string;
+    }>(`/calls/pending?activeCallId=${encodeURIComponent(callId)}`, { token: regA.data.token });
+    assert.equal(afterDecline.status, 200);
+    assert.equal(afterDecline.data.activeCallStatus, "declined");
+
+    const calleePendingAfter = await api<{ calls: Array<{ callId: string }> }>("/calls/pending", {
+      token: regB.data.token,
+    });
+    assert.equal(calleePendingAfter.status, 200);
+    assert.equal(calleePendingAfter.data.calls.length, 0);
+  } finally {
+    calleeWs2.ws.close();
+  }
+});

@@ -199,6 +199,15 @@ export function createCallClient(
   options: CallClientOptions = {},
 ) {
   let current: Session | undefined;
+  const settledCallIds = new Map<string, number>();
+
+  function markCallSettled(callId: string) {
+    const now = Date.now();
+    for (const [id, ts] of settledCallIds.entries()) {
+      if (now - ts > 120_000) settledCallIds.delete(id);
+    }
+    settledCallIds.set(callId, now);
+  }
 
   function emitSignal(event: string, payload: Record<string, unknown>): Promise<boolean> {
     if (sendWs(event, payload)) {
@@ -239,6 +248,7 @@ export function createCallClient(
   function finish(s: Session, notifyRemoteAction?: "declined" | "ended", message?: string) {
     if (current !== s) return;
     current = undefined;
+    markCallSettled(s.callId);
     clearTimeout(s.timer);
     clearTimeout(s.reconnectTimer);
     if (notifyRemoteAction) {
@@ -495,6 +505,7 @@ export function createCallClient(
   return {
     handleIncoming(payload: { callId: string; callType: Kind; from: PublicAccount }) {
       if (!payload?.callId || !payload.from?.id) return;
+      if (settledCallIds.has(payload.callId)) return;
       if (current) {
         if (current.callId === payload.callId) return;
         // If the user is genuinely engaged in an active answered conversation, signal busy
@@ -716,6 +727,7 @@ export function createCallClient(
             "Could not reach the call signaling server. Check your connection and retry.",
           );
         }
+        if (current !== s) return;
         s.status = "ringing";
         display(s);
       } catch (err) {
@@ -864,6 +876,16 @@ export function createCallClient(
       s.streamVersion += 1;
       sendMediaState(s);
       display(s);
+    },
+
+    getActiveCallSnapshot() {
+      if (!current) return null;
+      return {
+        callId: current.callId,
+        status: current.status,
+        isCaller: current.isCaller,
+        answering: current.answering,
+      };
     },
 
     dispose() {

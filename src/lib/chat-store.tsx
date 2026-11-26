@@ -305,6 +305,8 @@ let sseAbortController: AbortController | null = null;
 let sseReconnectTimer: number | null = null;
 let sseFallbackDelayTimer: number | null = null;
 let sseConnected = false;
+let pendingCallsPollTimer: number | null = null;
+let pendingCallsSyncInFlight = false;
 let callClient: ReturnType<typeof createCallClient> | undefined;
 let cachedIceServers: { servers: RTCIceServer[]; expiresAt: number } | null = null;
 
@@ -567,7 +569,23 @@ function stopSseFallback() {
   sseConnected = false;
 }
 
+function stopPendingCallsPolling() {
+  if (pendingCallsPollTimer) {
+    window.clearInterval(pendingCallsPollTimer);
+    pendingCallsPollTimer = null;
+  }
+}
+
+function startPendingCallsPolling() {
+  if (typeof window === "undefined" || pendingCallsPollTimer) return;
+  pendingCallsPollTimer = window.setInterval(() => {
+    if (!state.me || document.visibilityState === "hidden") return;
+    void syncPendingIncomingCalls();
+  }, 2000);
+}
+
 function disconnectRealtime() {
+  stopPendingCallsPolling();
   if (wsReconnectTimer) {
     window.clearTimeout(wsReconnectTimer);
     wsReconnectTimer = null;
@@ -627,13 +645,80 @@ async function fetchCallIceServers(): Promise<RTCIceServer[]> {
   }
 }
 
+async function syncPendingIncomingCalls(): Promise<void> {
+  if (typeof window === "undefined" || !state.me || pendingCallsSyncInFlight) return;
+  pendingCallsSyncInFlight = true;
+  try {
+    const active = callClient?.getActiveCallSnapshot() ?? null;
+    const params = new URLSearchParams();
+    if (active?.callId) {
+      params.set("activeCallId", active.callId);
+      if (!isRealtimeOpen()) {
+        params.set("drainSignals", "1");
+      }
+    }
+    const qs = params.toString();
+    const data = await apiJson<{
+      calls?: IncomingCall[];
+      activeCallStatus?: string;
+      signals?: CallSignalMessage[];
+    }>(qs ? `/api/calls/pending?${qs}` : "/api/calls/pending");
+
+    if (!state.me) return;
+    const client = ensureCallClient();
+    if (Array.isArray(data.calls)) {
+      for (const incoming of data.calls) {
+        if (incoming?.callId && incoming.from?.id) {
+          client.handleIncoming(incoming);
+        }
+      }
+    }
+    if (Array.isArray(data.signals)) {
+      for (const sig of data.signals) {
+        if (sig?.callId && sig.action) {
+          void client.handleSignal(sig);
+        }
+      }
+    }
+    if (
+      active?.callId &&
+      (data.activeCallStatus === "ended" ||
+        data.activeCallStatus === "declined" ||
+        data.activeCallStatus === "busy")
+    ) {
+      void client.handleSignal({ callId: active.callId, action: data.activeCallStatus });
+    }
+  } catch {
+    /* ignore transient polling failures */
+  } finally {
+    pendingCallsSyncInFlight = false;
+  }
+}
+
 async function sendCallSignalHttp(
   event: string,
   payload: Record<string, unknown>,
 ): Promise<boolean> {
   if (!state.me) return false;
   if (event === "call:initiate") {
-    await apiJson("/api/calls/initiate", { method: "POST", body: payload });
+    const res = await apiJson<{
+      ok: boolean;
+      callId: string;
+      targetId: string;
+      callType: "audio" | "video";
+      recipientOnline: boolean;
+      busy?: boolean;
+    }>("/api/calls/initiate", { method: "POST", body: payload });
+    if (res.busy) {
+      void ensureCallClient().handleSignal({ callId: res.callId, action: "busy" });
+    } else {
+      ensureCallClient().handleRinging({
+        callId: res.callId,
+        targetId: res.targetId,
+        callType: res.callType,
+        recipientOnline: res.recipientOnline,
+      });
+    }
     return true;
   }
   if (event === "call:signal") {
@@ -793,7 +878,11 @@ function handleIncomingMessageEvent(msg: ChatMessage, sender?: PublicAccount) {
 }
 
 function handleRealtimeEvent(event: string | undefined, payload: Record<string, unknown>) {
-  if (!event || event === "pong" || event === "connected") return;
+  if (!event || event === "pong") return;
+  if (event === "connected") {
+    void syncPendingIncomingCalls();
+    return;
+  }
 
   if (event === "presence:update") {
     const userId = String(payload["userId"] ?? "");
@@ -1058,6 +1147,7 @@ async function connectSseFallback(): Promise<void> {
 
     sseConnected = true;
     setState({ wsConnected: true });
+    void syncPendingIncomingCalls();
     if (state.activePeerId) {
       void apiJson("/api/thread/active", {
         method: "POST",
@@ -1179,7 +1269,7 @@ async function connectRealtimeAsync(): Promise<void> {
         sendWs("thread:active", { peerId: state.activePeerId });
         void openThread(state.activePeerId);
       }
-      void Promise.allSettled([loadConversations(), discoverUsers()]);
+      void Promise.allSettled([loadConversations(), discoverUsers(), syncPendingIncomingCalls()]);
     };
 
     socket.onmessage = (evt) => {
@@ -1251,12 +1341,14 @@ async function hydrateAuthenticatedSession(user: PublicAccount, token?: string |
     sessionToken,
   });
   connectRealtime();
+  startPendingCallsPolling();
   void Promise.allSettled([
     loadConversations(),
     discoverUsers(),
     fetchNfcLink(),
     fetchGallery(),
     loadBlocks(),
+    syncPendingIncomingCalls(),
   ]);
 }
 
@@ -1299,13 +1391,15 @@ function bootstrap() {
   window.addEventListener("online", () => {
     if (state.me) {
       connectRealtime();
-      void Promise.allSettled([loadConversations(), discoverUsers()]);
+      startPendingCallsPolling();
+      void Promise.allSettled([loadConversations(), discoverUsers(), syncPendingIncomingCalls()]);
     }
   });
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible" && state.me) {
       connectRealtime();
-      void Promise.allSettled([loadConversations(), discoverUsers()]);
+      startPendingCallsPolling();
+      void Promise.allSettled([loadConversations(), discoverUsers(), syncPendingIncomingCalls()]);
     }
   });
 

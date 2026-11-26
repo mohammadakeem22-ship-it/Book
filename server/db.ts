@@ -236,6 +236,18 @@ function getLocalDb(): Database.Database {
       quiet_hours_enabled INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS call_invitations (
+      call_id TEXT PRIMARY KEY,
+      caller_id TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      call_type TEXT NOT NULL DEFAULT 'audio',
+      status TEXT NOT NULL DEFAULT 'ringing',
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_call_invitations_target_status
+      ON call_invitations(target_id, status, expires_at);
   `);
 
   ensureColumns(localDb, "media_objects", [

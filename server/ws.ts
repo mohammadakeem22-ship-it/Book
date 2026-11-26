@@ -14,8 +14,9 @@ import {
   toPublicUser,
   verifyCookieToken,
   type DbUser,
+  type PublicUser,
 } from "./db";
-import { getFirebaseAdminAuth } from "./firebase-admin";
+import { getFirebaseAdminAuth, getFirebaseAdminMessaging } from "./firebase-admin";
 
 type ClientSocket = WebSocket & {
   userId?: string;
@@ -50,6 +51,24 @@ type BufferedSignal = {
   createdAt: number;
 };
 
+export type PendingCallInvitation = {
+  callId: string;
+  callType: "audio" | "video";
+  from: PublicUser;
+  createdAt: string;
+};
+
+type CallInvitationRow = {
+  call_id: string;
+  caller_id: string;
+  target_id: string;
+  call_type: string;
+  status: string;
+  created_at: string;
+  expires_at: string;
+  updated_at: string;
+};
+
 const CALL_TTL_MS = 45_000;
 const ANSWERED_CALL_TTL_MS = 4 * 60 * 60 * 1000;
 const SIGNAL_BUFFER_TTL_MS = 60_000;
@@ -62,6 +81,56 @@ const pendingCallOffers = new Map<string, PendingCallOffer>();
 const pendingSignalsByUser = new Map<string, BufferedSignal[]>();
 const disconnectCallTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+async function persistCallInvitation(offer: PendingCallOffer) {
+  const createdIso = new Date(offer.createdAt).toISOString();
+  const expiresIso = new Date(offer.createdAt + CALL_TTL_MS).toISOString();
+  const nowIso = new Date().toISOString();
+  try {
+    await db
+      .prepare(
+        `UPDATE call_invitations
+         SET status = 'ended', updated_at = ?
+         WHERE caller_id = ? AND target_id = ? AND status = 'ringing' AND call_id <> ?`,
+      )
+      .run(nowIso, offer.caller.id, offer.targetId, offer.callId);
+
+    await db
+      .prepare(
+        `INSERT INTO call_invitations (call_id, caller_id, target_id, call_type, status, created_at, expires_at, updated_at)
+         VALUES (?, ?, ?, ?, 'ringing', ?, ?, ?)
+         ON CONFLICT(call_id) DO UPDATE SET
+           caller_id = excluded.caller_id,
+           target_id = excluded.target_id,
+           call_type = excluded.call_type,
+           status = excluded.status,
+           expires_at = excluded.expires_at,
+           updated_at = excluded.updated_at`,
+      )
+      .run(
+        offer.callId,
+        offer.caller.id,
+        offer.targetId,
+        offer.callType,
+        createdIso,
+        expiresIso,
+        nowIso,
+      );
+  } catch {
+    /* Graceful fallback to in-memory pendingCallOffers if DB table is unavailable */
+  }
+}
+
+async function updateCallInvitationStatus(callId: string, status: string) {
+  if (!callId) return;
+  try {
+    await db
+      .prepare("UPDATE call_invitations SET status = ?, updated_at = ? WHERE call_id = ?")
+      .run(status, new Date().toISOString(), callId);
+  } catch {
+    /* Graceful fallback if DB table is unavailable */
+  }
+}
+
 export function pruneStaleCalls() {
   const now = Date.now();
   for (const [key, call] of activeCallPeers.entries()) {
@@ -70,9 +139,9 @@ export function pruneStaleCalls() {
       activeCallPeers.delete(key);
     }
   }
-  for (const [key, pending] of pendingCallOffers.entries()) {
+  for (const [callId, pending] of pendingCallOffers.entries()) {
     if (now - pending.createdAt > CALL_TTL_MS) {
-      pendingCallOffers.delete(key);
+      pendingCallOffers.delete(callId);
     }
   }
   for (const [key, list] of pendingSignalsByUser.entries()) {
@@ -162,8 +231,12 @@ export function sendToUser(userId: string, event: string, payload: unknown): boo
     for (const ws of set) {
       if (ws.readyState === WebSocket.OPEN && !sentSockets.has(ws)) {
         sentSockets.add(ws);
-        ws.send(serialized);
-        delivered = true;
+        try {
+          ws.send(serialized);
+          delivered = true;
+        } catch {
+          // Ignore closing socket; close handler cleans it up
+        }
       }
     }
   }
@@ -199,7 +272,11 @@ export function broadcastEvent(event: string, payload: unknown, excludeUserId?: 
     for (const ws of set) {
       if (ws.readyState === WebSocket.OPEN && !sentSockets.has(ws)) {
         sentSockets.add(ws);
-        ws.send(serialized);
+        try {
+          ws.send(serialized);
+        } catch {
+          /* ignore closing socket */
+        }
       }
     }
   }
@@ -438,6 +515,8 @@ function scheduleDisconnectCleanup(userId: string) {
       const activeCall = activeCallPeers.get(alias);
       if (activeCall) {
         activeCallPeers.delete(alias);
+        pendingCallOffers.delete(activeCall.callId);
+        void updateCallInvitationStatus(activeCall.callId, "ended");
         const peerAliases = getUserAliases(activeCall.peerId);
         for (const pAlias of peerAliases) {
           const peerActive = activeCallPeers.get(pAlias);
@@ -458,7 +537,15 @@ function scheduleDisconnectCleanup(userId: string) {
           candidate: null,
         });
       }
-      pendingCallOffers.delete(alias);
+    }
+
+    // Also end any ringing invitations originated by the disconnected caller
+    const callerAliasSet = new Set(aliases);
+    for (const [callId, offer] of pendingCallOffers.entries()) {
+      if (callerAliasSet.has(offer.caller.id)) {
+        pendingCallOffers.delete(callId);
+        void updateCallInvitationStatus(callId, "ended");
+      }
     }
     void broadcastPresence(userId, false);
   }, DISCONNECT_GRACE_MS);
@@ -469,43 +556,158 @@ function scheduleDisconnectCleanup(userId: string) {
   }
 }
 
-function deliverPendingForUser(userId: string) {
+export async function getPendingIncomingCallsForUser(
+  userId: string,
+): Promise<PendingCallInvitation[]> {
   pruneStaleCalls();
-  cancelDisconnectGraceTimers(userId);
   const aliases = getUserAliases(userId);
+  if (aliases.length === 0) return [];
+  const aliasSet = new Set(aliases);
+  const nowMs = Date.now();
+  const byCallId = new Map<string, PendingCallInvitation>();
 
-  for (const alias of aliases) {
-    const pending = pendingCallOffers.get(alias);
-    if (pending && Date.now() - pending.createdAt < CALL_TTL_MS) {
-      pendingCallOffers.delete(alias);
-      void toPublicUser(pending.caller, true, alias).then((fromPub) => {
-        sendToUser(alias, "call:incoming", {
-          callId: pending.callId,
-          callType: pending.callType,
-          from: fromPub,
-        });
-        sendToUser(pending.caller.id, "call:ringing", {
-          callId: pending.callId,
-          targetId: alias,
-          callType: pending.callType,
-          recipientOnline: true,
-        });
+  // 1. Check durable database invitations first (handles reconnects, page reloads, multi-instance)
+  try {
+    const nowIso = new Date(nowMs).toISOString();
+    const placeholders = aliases.map(() => "?").join(",");
+    const rows = (await db
+      .prepare(
+        `SELECT * FROM call_invitations
+         WHERE target_id IN (${placeholders}) AND status = 'ringing' AND expires_at > ?
+         ORDER BY created_at DESC`,
+      )
+      .all(...aliases, nowIso)) as CallInvitationRow[];
+
+    for (const row of rows) {
+      if (!row?.call_id || byCallId.has(row.call_id)) continue;
+      if (await isBlockedBetween(row.caller_id, userId)) continue;
+      const callerAliases = getUserAliases(row.caller_id);
+      const callerPlaceholders = callerAliases.map(() => "?").join(",");
+      const caller = (await db
+        .prepare(`SELECT * FROM users WHERE id IN (${callerPlaceholders}) LIMIT 1`)
+        .get(...callerAliases)) as DbUser | undefined;
+      if (!caller) continue;
+      byCallId.set(row.call_id, {
+        callId: row.call_id,
+        callType: row.call_type === "video" ? "video" : "audio",
+        from: await toPublicUser(caller, true, userId),
+        createdAt: row.created_at,
       });
     }
+  } catch {
+    /* Fallback cleanly to in-memory pendingCallOffers below */
   }
 
-  // Replay buffered call signals (e.g. accepted/offer/answer/ice) if peer missed them during a brief reconnect
+  // 2. Include in-memory ringing offers (e.g. if DB persistence was skipped)
+  for (const pending of pendingCallOffers.values()) {
+    if (nowMs - pending.createdAt > CALL_TTL_MS) continue;
+    const targetAliases = getUserAliases(pending.targetId);
+    if (!targetAliases.some((a) => aliasSet.has(a))) continue;
+    if (byCallId.has(pending.callId)) continue;
+    if (await isBlockedBetween(pending.caller.id, userId)) continue;
+    byCallId.set(pending.callId, {
+      callId: pending.callId,
+      callType: pending.callType,
+      from: await toPublicUser(pending.caller, true, userId),
+      createdAt: new Date(pending.createdAt).toISOString(),
+    });
+  }
+
+  return Array.from(byCallId.values()).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function getCallInvitationStatus(
+  callId: string,
+  viewerId: string,
+): Promise<string | null> {
+  if (!callId) return null;
+  const viewerAliases = new Set(getUserAliases(viewerId));
+  try {
+    const row = (await db
+      .prepare(
+        "SELECT caller_id, target_id, status, expires_at FROM call_invitations WHERE call_id = ? LIMIT 1",
+      )
+      .get(callId)) as
+      { caller_id: string; target_id: string; status: string; expires_at: string } | undefined;
+    if (row) {
+      const isParticipant =
+        getUserAliases(row.caller_id).some((a) => viewerAliases.has(a)) ||
+        getUserAliases(row.target_id).some((a) => viewerAliases.has(a));
+      if (!isParticipant) return null;
+      if (row.status === "ringing" && Date.parse(row.expires_at) <= Date.now()) {
+        return "ended";
+      }
+      return row.status;
+    }
+  } catch {
+    /* Fallback to in-memory check */
+  }
+  const mem = pendingCallOffers.get(callId);
+  if (mem) {
+    const isParticipant =
+      getUserAliases(mem.caller.id).some((a) => viewerAliases.has(a)) ||
+      getUserAliases(mem.targetId).some((a) => viewerAliases.has(a));
+    if (isParticipant) return "ringing";
+  }
+  return null;
+}
+
+export function popBufferedSignalsForUser(
+  userId: string,
+  callIdFilter?: string,
+): Record<string, unknown>[] {
+  pruneStaleCalls();
+  const aliases = getUserAliases(userId);
   const replayed = new Set<string>();
+  const out: Record<string, unknown>[] = [];
   for (const alias of aliases) {
     const buffered = pendingSignalsByUser.get(alias);
     if (!buffered || buffered.length === 0) continue;
-    pendingSignalsByUser.delete(alias);
+    const remaining: BufferedSignal[] = [];
     for (const item of buffered) {
-      const key = `${String(item.payload["callId"] ?? "")}:${String(item.payload["action"] ?? "")}:${JSON.stringify(item.payload["candidate"] ?? item.payload["sdp"] ?? "")}`;
+      const itemCallId = String(item.payload["callId"] ?? "");
+      if (callIdFilter && itemCallId !== callIdFilter) {
+        remaining.push(item);
+        continue;
+      }
+      const key = `${itemCallId}:${String(item.payload["action"] ?? "")}:${JSON.stringify(item.payload["candidate"] ?? item.payload["sdp"] ?? "")}`;
       if (replayed.has(key)) continue;
       replayed.add(key);
-      sendToUser(userId, "call:signal", item.payload);
+      out.push(item.payload);
     }
+    if (remaining.length === 0) {
+      pendingSignalsByUser.delete(alias);
+    } else {
+      pendingSignalsByUser.set(alias, remaining);
+    }
+  }
+  return out;
+}
+
+function deliverPendingForUser(userId: string) {
+  pruneStaleCalls();
+  cancelDisconnectGraceTimers(userId);
+
+  // Keep pendingCallOffers intact until answered/declined/ended/expired so dropped or half-open sockets never lose the ring.
+  void getPendingIncomingCallsForUser(userId).then((pendingCalls) => {
+    for (const call of pendingCalls) {
+      sendToUser(userId, "call:incoming", {
+        callId: call.callId,
+        callType: call.callType,
+        from: call.from,
+      });
+      sendToUser(call.from.id, "call:ringing", {
+        callId: call.callId,
+        targetId: userId,
+        callType: call.callType,
+        recipientOnline: true,
+      });
+    }
+  });
+
+  // Replay buffered call signals (e.g. accepted/offer/answer/ice) if peer missed them during a brief reconnect
+  for (const signalPayload of popBufferedSignalsForUser(userId)) {
+    sendToUser(userId, "call:signal", signalPayload);
   }
 }
 
@@ -617,6 +819,18 @@ export async function initiateCallSession(input: {
 
   const nowTs = Date.now();
   clearBufferedSignalsForUser(canonicalTargetId);
+
+  // Supersede any older still-ringing offer from this caller to this target
+  for (const [existingCallId, existingOffer] of pendingCallOffers.entries()) {
+    if (
+      existingCallId !== callId &&
+      existingOffer.caller.id === canonicalCallerId &&
+      existingOffer.targetId === canonicalTargetId
+    ) {
+      pendingCallOffers.delete(existingCallId);
+    }
+  }
+
   for (const cAlias of getUserAliases(canonicalCallerId)) {
     activeCallPeers.set(cAlias, {
       callId,
@@ -632,27 +846,27 @@ export async function initiateCallSession(input: {
       createdAt: nowTs,
       answered: false,
     });
-    pendingCallOffers.set(tAlias, {
-      callId,
-      callType,
-      caller,
-      targetId: canonicalTargetId,
-      createdAt: nowTs,
-    });
   }
 
+  const offer: PendingCallOffer = {
+    callId,
+    callType,
+    caller,
+    targetId: canonicalTargetId,
+    createdAt: nowTs,
+  };
+  pendingCallOffers.set(callId, offer);
+  await persistCallInvitation(offer);
+
+  const callerPublic = await toPublicUser(caller, true, canonicalTargetId);
   const callPayload = {
     callId,
     callType,
-    from: await toPublicUser(caller, true, canonicalTargetId),
+    from: callerPublic,
   };
 
-  const deliveredIncoming = sendToUser(canonicalTargetId, "call:incoming", callPayload);
-  if (deliveredIncoming) {
-    for (const tAlias of getUserAliases(canonicalTargetId)) {
-      pendingCallOffers.delete(tAlias);
-    }
-  }
+  // Push via WS/SSE if open, while preserving the ringing invitation in memory + DB until answered/declined/ended/expired
+  sendToUser(canonicalTargetId, "call:incoming", callPayload);
 
   sendToUser(canonicalCallerId, "call:ringing", {
     callId,
@@ -660,6 +874,63 @@ export async function initiateCallSession(input: {
     callType,
     recipientOnline,
   });
+
+  // Best-effort FCM push notification for backgrounded/idle PWAs
+  void (async () => {
+    try {
+      const messaging = getFirebaseAdminMessaging();
+      if (!messaging) return;
+      const convSetting = (await db
+        .prepare(
+          "SELECT muted FROM conversation_settings WHERE user_id = ? AND peer_id = ? LIMIT 1",
+        )
+        .get(canonicalTargetId, canonicalCallerId)) as { muted: number } | undefined;
+      if (convSetting?.muted === 1) return;
+
+      const prefs = (await db
+        .prepare(
+          "SELECT push_enabled, call_alerts, quiet_hours_enabled FROM notification_preferences WHERE user_id = ? LIMIT 1",
+        )
+        .get(canonicalTargetId)) as
+        { push_enabled: number; call_alerts: number; quiet_hours_enabled: number } | undefined;
+      if (
+        prefs &&
+        (prefs.push_enabled === 0 || prefs.call_alerts === 0 || prefs.quiet_hours_enabled === 1)
+      ) {
+        return;
+      }
+
+      const tokenRows = (await db
+        .prepare("SELECT token FROM notification_tokens WHERE user_id = ?")
+        .all(canonicalTargetId)) as { token: string }[];
+      const tokens = tokenRows.map((r) => r.token).filter(Boolean);
+      if (tokens.length === 0) return;
+
+      const label = callType === "video" ? "video call" : "audio call";
+      const targetPath = `/messages?peer=${encodeURIComponent(canonicalCallerId)}`;
+      await messaging.sendEachForMulticast({
+        tokens,
+        notification: {
+          title: "Reading Corner",
+          body: `Incoming ${label} from ${caller.full_name}`,
+        },
+        data: {
+          callId,
+          callType,
+          peerId: canonicalCallerId,
+          senderName: caller.full_name,
+          path: targetPath,
+        },
+        webpush: {
+          fcmOptions: {
+            link: targetPath,
+          },
+        },
+      });
+    } catch {
+      /* ignore optional push errors */
+    }
+  })();
 
   return {
     ok: true,
@@ -702,6 +973,8 @@ export async function forwardCallSignal(input: {
 
   if (action === "accepted") {
     const acceptedTs = Date.now();
+    pendingCallOffers.delete(callId);
+    await updateCallInvitationStatus(callId, "accepted");
     for (const uAlias of userAliases) {
       activeCallPeers.set(uAlias, {
         callId,
@@ -709,7 +982,6 @@ export async function forwardCallSignal(input: {
         createdAt: acceptedTs,
         answered: true,
       });
-      pendingCallOffers.delete(uAlias);
     }
     for (const tAlias of targetAliases) {
       activeCallPeers.set(tAlias, {
@@ -718,12 +990,12 @@ export async function forwardCallSignal(input: {
         createdAt: acceptedTs,
         answered: true,
       });
-      pendingCallOffers.delete(tAlias);
     }
   } else if (action === "declined" || action === "ended" || action === "busy") {
+    pendingCallOffers.delete(callId);
+    await updateCallInvitationStatus(callId, action);
     for (const uAlias of userAliases) {
       activeCallPeers.delete(uAlias);
-      pendingCallOffers.delete(uAlias);
     }
     for (const tAlias of targetAliases) {
       const theirs = activeCallPeers.get(tAlias);
@@ -735,7 +1007,6 @@ export async function forwardCallSignal(input: {
       ) {
         activeCallPeers.delete(tAlias);
       }
-      pendingCallOffers.delete(tAlias);
     }
   }
 
