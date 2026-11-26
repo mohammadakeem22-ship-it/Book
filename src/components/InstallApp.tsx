@@ -58,14 +58,20 @@ export function InstallApp() {
       <button
         type="button"
         className="press inline-flex min-h-11 items-center gap-2 rounded-full px-4 text-sm font-bold text-primary"
-        aria-expanded={!prompt ? help : undefined}
-        aria-controls={help ? id : undefined}
-        onClick={() => setHelp(!help)}
+        aria-expanded={prompt ? undefined : help}
+        aria-controls={help && !prompt ? id : undefined}
+        onClick={() => {
+          if (prompt) {
+            void prompt();
+          } else {
+            setHelp(!help);
+          }
+        }}
       >
         <Download aria-hidden="true" className="size-4" />
         Install app
       </button>
-      {help && (
+      {help && !prompt && (
         <div
           id={id}
           className="max-w-sm rounded-2xl bg-card p-4 text-left text-sm text-foreground shadow-soft"
