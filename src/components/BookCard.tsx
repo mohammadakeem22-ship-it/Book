@@ -81,7 +81,7 @@ export function BookRow({
       <Link
         to="/book/$bookId"
         params={{ bookId: book.id }}
-        className="flex items-center gap-3.5 rounded-2xl bg-card p-3 shadow-soft transition-shadow hover:shadow-lift"
+        className="library-glass flex items-center gap-3.5 rounded-3xl p-3 shadow-soft transition-all hover:-translate-y-0.5 hover:shadow-lift"
       >
         <div className="w-14 shrink-0">
           <BookCover book={book} size="sm" />
