@@ -199,7 +199,7 @@ function BookDetails() {
                 to="/read/$bookId"
                 search={{}}
                 params={{ bookId: book.id }}
-                className="press flex flex-1 items-center justify-center gap-2 rounded-full bg-brand px-5 py-3 text-center text-sm font-bold text-primary-foreground shadow-lift sm:flex-none sm:px-8"
+                className="press glass-sheen flex flex-1 items-center justify-center gap-2 rounded-full border border-white/35 bg-amber-900/85 px-5 py-3 text-center text-sm font-bold text-white shadow-lift backdrop-blur-md sm:flex-none sm:px-8"
               >
                 <BookOpen className="size-4" />
                 {progress ? "Continue Reading" : "Read Full-Screen"}
