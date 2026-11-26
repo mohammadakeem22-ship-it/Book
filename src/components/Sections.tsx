@@ -68,12 +68,9 @@ export function CategoryChips({ limit }: { limit?: number }) {
           key={c.slug}
           to="/category/$slug"
           params={{ slug: c.slug }}
-          className={cn(
-            "press flex items-center gap-3 rounded-2xl bg-gradient-to-br p-3.5 shadow-soft dark:bg-card dark:bg-none",
-            c.tint,
-          )}
+          className="press library-glass flex items-center gap-3 rounded-3xl p-3.5 shadow-soft transition-transform hover:-translate-y-0.5"
         >
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-card/80 text-lg">
+          <span className="grid size-10 shrink-0 place-items-center rounded-2xl bg-gold/20 text-lg">
             {c.icon}
           </span>
           <span className="min-w-0 truncate text-sm font-semibold text-foreground">{c.name}</span>
@@ -92,9 +89,9 @@ export function LanguageChips({ limit }: { limit?: number }) {
           key={l.code}
           to="/language/$code"
           params={{ code: l.code }}
-          className="press flex items-center gap-3 rounded-2xl bg-card p-3.5 shadow-soft"
+          className="press library-glass flex items-center gap-3 rounded-3xl p-3.5 shadow-soft transition-transform hover:-translate-y-0.5"
         >
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-secondary text-lg">
+          <span className="grid size-10 shrink-0 place-items-center rounded-2xl bg-gold/20 text-lg">
             {l.flag}
           </span>
           <span className="min-w-0">

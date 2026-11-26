@@ -68,7 +68,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [navigate]);
 
   return (
-    <div className="min-h-screen bg-background lg:flex">
+    <div className="min-h-screen bg-transparent lg:flex">
       <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col border-r border-sidebar-border bg-sidebar px-4 py-6 lg:flex">
         <Link to="/home" className="mb-8 flex items-center gap-2.5 px-2">
           <Logo className="size-9" />

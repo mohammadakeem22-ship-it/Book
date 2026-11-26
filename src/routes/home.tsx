@@ -101,7 +101,7 @@ function HomePage() {
             </p>
             <Link
               to="/explore"
-              className="press mt-5 inline-flex rounded-full bg-brand px-5 py-2.5 text-sm font-bold text-primary-foreground shadow-lift"
+              className="press glass-sheen mt-5 inline-flex rounded-full border border-white/35 bg-amber-900/85 px-5 py-2.5 text-sm font-bold text-white shadow-lift backdrop-blur-md"
             >
               Explore Books
             </Link>

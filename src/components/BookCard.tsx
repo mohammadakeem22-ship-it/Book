@@ -23,14 +23,17 @@ export function BookCard({
       whileHover={{ y: -4 }}
       whileTap={{ scale: 0.97 }}
       transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
-      className={cn("group", className)}
+      className={cn(
+        "group rounded-2xl p-2.5 library-glass transition-shadow hover:shadow-lift",
+        className,
+      )}
     >
       <Link
         to="/book/$bookId"
         params={{ bookId: book.id }}
         className="block rounded-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
       >
-        <div className="overflow-hidden rounded-xl shadow-soft transition-shadow duration-200 group-hover:shadow-lift">
+        <div className="glass-sheen overflow-hidden rounded-xl shadow-soft transition-shadow duration-200 group-hover:shadow-lift">
           <BookCover book={book} />
         </div>
         <div className="mt-2.5 space-y-1">
@@ -78,7 +81,7 @@ export function BookRow({
       <Link
         to="/book/$bookId"
         params={{ bookId: book.id }}
-        className="flex items-center gap-3.5 rounded-2xl bg-card p-3 shadow-soft transition-shadow hover:shadow-lift"
+        className="library-glass flex items-center gap-3.5 rounded-3xl p-3 shadow-soft transition-all hover:-translate-y-0.5 hover:shadow-lift"
       >
         <div className="w-14 shrink-0">
           <BookCover book={book} size="sm" />
